@@ -1,16 +1,24 @@
 {
   "name": "buckles",
   "version": "1.0.0",
+  "private": true,
+  "type": "module",
   "description": "",
-  "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "build": "pnpm -r build",
+    "typecheck": "pnpm build && tsrs --noEmit -p tsconfig.json",
+    "test": "pnpm build && node --test packages/*/test/*.test.mjs && pnpm test:example",
+    "test:example": "node --import tsx --test test/example.test.mjs"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "packageManager": "pnpm@10.33.3",
   "devDependencies": {
-    "tsrs": "0.22.0-ts7.1.0-beta"
+    "@buckles/adapters": "workspace:*",
+    "@buckles/factory": "workspace:*",
+    "@types/node": "^22",
+    "tsrs": "0.22.0-ts7.1.0-beta",
+    "tsx": "^4.23.15"
   }
 }

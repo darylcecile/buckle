@@ -1,0 +1,19 @@
+{
+	"name": "@buckles/factory",
+	"version": "1.0.0",
+	"description": "Composable agent workflow definitions and shared session contexts.",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
+	},
+	"files": ["dist", "src"],
+	"engines": { "node": ">=22" },
+	"scripts": {
+		"build": "tsrs -p tsconfig.json",
+		"typecheck": "tsrs --noEmit -p tsconfig.json",
+		"test": "pnpm build && node --test test/*.test.mjs",
+		"prepack": "pnpm build"
+	}
+}
