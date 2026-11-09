@@ -1,14 +1,18 @@
-import { Stage, Instruction } from '@buckles/factory';
+import { Stage, Instruction, Reference, Container } from '@buckles/factory';
 import { accessibilityReviewAgent, codeReviewAgent, implementationAgent, todoAgent, triageAgent, visualReviewAgent, checksAgent, doneAgent } from './agents';
 import { dependencies, learnings, plan, userDecisions, githubContext, reviewFindings, checksFindings } from './context';
 import { Github } from '@buckles/adapters';
+
+const mainContainerReference = new Reference("mainContainer");
+const reviewContainerReference = new Reference("reviewContainer");
 
 export const todoStage = new Stage({
 	name: "Todo",
 	kind: "todo",
 	agents: [ todoAgent ],
 	contexts: [ plan, userDecisions ],
-	instruction: "Clarify the outcome, constraints and acceptance criteria."
+	instruction: "Clarify the outcome, constraints and acceptance criteria.",
+	container: Container.createOrReuse(mainContainerReference),
 });
 
 export const triageStage = new Stage({
@@ -19,7 +23,8 @@ export const triageStage = new Stage({
 	policies: {
 		returns: () => [ todoStage ]
 	},
-	instruction: "Select repository work or existing PRs and define responsibilities and dependencies."
+	instruction: "Select repository work or existing PRs and define responsibilities and dependencies.",
+	container: Container.createOrReuse(mainContainerReference),
 });
 
 export const implementationStage = new Stage({
@@ -30,6 +35,7 @@ export const implementationStage = new Stage({
 		returns: () => [ todoStage, triageStage ]
 	},
 	instruction: "Implement the chosen task according to the determined priority and next steps.",
+	container: Container.createOrReuse(mainContainerReference),
 });
 
 export const checksStage = new Stage({
@@ -47,7 +53,8 @@ export const checksStage = new Stage({
 			})
 		],
 	},
-	instruction: Instruction.fromFile('checks')
+	instruction: Instruction.fromFile('checks'),
+	container: Container.createOrReuse(mainContainerReference),
 });
 
 export const reviewStage = new Stage({
@@ -63,7 +70,8 @@ export const reviewStage = new Stage({
 	policies: {
 		returns: () => [ triageStage, implementationStage ],
 	},
-	instruction: Instruction.fromFile('review')
+	instruction: Instruction.fromFile('review'),
+	container: Container.createOrReuse(reviewContainerReference),
 });
 
 export const mergeStage = new Stage({
@@ -78,7 +86,8 @@ export const mergeStage = new Stage({
 			Github.act.Merge(githubContext)
 		]
 	},
-	instruction: Instruction.fromFile('merge')
+	instruction: Instruction.fromFile('merge'),
+	container: Container.createOrReuse(mainContainerReference),
 });
 
 export const doneStage = new Stage({
@@ -89,5 +98,6 @@ export const doneStage = new Stage({
 	policies: {
 		permissions: { createNewTasks: true }
 	},
-	instruction: Instruction.fromFile('done')
+	instruction: Instruction.fromFile('done'),
+	container: Container.createOrReuse(mainContainerReference)
 });

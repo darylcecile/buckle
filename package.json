@@ -6,6 +6,7 @@
   "description": "",
   "scripts": {
     "build": "pnpm -r build",
+    "cli": "node packages/cli/dist/bin.js",
     "typecheck": "pnpm build && tsrs --noEmit -p tsconfig.json",
     "test": "pnpm build && node --test packages/*/test/*.test.mjs && pnpm test:example",
     "test:example": "node --import tsx --test test/example.test.mjs"
@@ -16,7 +17,9 @@
   "packageManager": "pnpm@10.33.3",
   "devDependencies": {
     "@buckles/adapters": "workspace:*",
+    "@buckles/cli": "workspace:*",
     "@buckles/factory": "workspace:*",
+    "@buckles/utils": "workspace:*",
     "@types/node": "^22",
     "tsrs": "0.22.0-ts7.1.0-beta",
     "tsx": "^4.23.15"

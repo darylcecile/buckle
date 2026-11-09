@@ -1,8 +1,11 @@
 import { readFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { extname, isAbsolute, resolve } from "node:path";
 import type { SessionContext } from "./context.js";
+import { Container, Reference } from "./container.js";
 
 export { SessionContext, type SessionContextOptions } from "./context.js";
+export { Container, Reference, type MicroVMOptions, type MicroVMNetwork, type MicroVMState, type MicroVMExecOptions } from "./container.js";
 
 /** Options shared by adapter model descriptors. */
 export interface ModelOptions {
@@ -116,40 +119,25 @@ export class Agent {
 	}
 }
 
-/** Reserved for future supervisor configuration; only an empty object is accepted. */
-export type SupervisorOptions = Record<string, never>;
+/** Optional supervisor metadata; consumers decide how to use it. */
+export interface SupervisorOptions {
+	/** Adapter-provided model descriptor; no model client is started. */
+	model?: Model;
+	/** Requested interval in milliseconds, finite and nonnegative; fractions are accepted. No scheduling occurs. */
+	wakeupInterval?: number;
+}
 
 /** Supervisor definition. It does not schedule workflows or execute agents. */
 export class Supervisor {
 	declare private readonly _brand: void;
 	/** Captured supervisor configuration. */
 	readonly options: Readonly<SupervisorOptions>;
-	/** Creates a supervisor definition from an empty options object. */
-	constructor(options: SupervisorOptions) { this.options = Object.freeze({ ...options }); }
-}
-
-/** Resource requirements for a MicroVM; no provisioning is performed. */
-export interface MicroVMOptions {
-	/** Container image reference, such as `ubuntu:latest`. */
-	image: string;
-	/** Memory request as a provider-facing string, such as `16GB`. */
-	memory: string;
-	/** Positive CPU allocation. */
-	cpu: number;
-}
-
-/** Container definitions available to workflows. */
-export namespace Container {
-	/** Declarative MicroVM resource request, not a running machine. */
-	export class MicroVM {
-		declare private readonly _brand: void;
-		/** Captured image and resource requirements. */
-		readonly options: Readonly<MicroVMOptions>;
-		/** Creates a container definition without provisioning resources. */
-		constructor(options: MicroVMOptions) {
-			if (!Number.isFinite(options.cpu) || options.cpu <= 0) throw new RangeError("cpu must be positive");
-			this.options = Object.freeze({ ...options });
+	/** Captures optional metadata without starting a timer or contacting a model provider. */
+	constructor(options: SupervisorOptions) {
+		if (options.wakeupInterval !== undefined && (!Number.isFinite(options.wakeupInterval) || options.wakeupInterval < 0)) {
+			throw new RangeError("wakeupInterval must be finite and nonnegative milliseconds");
 		}
+		this.options = Object.freeze({ ...options });
 	}
 }
 
@@ -170,7 +158,7 @@ export interface WorkflowPolicies {
 export interface WorkflowOptions {
 	/** Display name of the workflow. */
 	name: string;
-	/** Requested execution environment; never provisioned by this package. */
+	/** Default resource template; resolving a stage clones it per task without provisioning. */
 	container: Container.MicroVM;
 	/** Inline text or a deferred instruction reference shared by stages. */
 	instruction: string | Instruction;
@@ -183,6 +171,7 @@ export interface WorkflowOptions {
 /** Ordered workflow definition; construction does not call hooks, gates, or return policies. */
 export class Workflow {
 	declare private readonly _brand: void;
+	private readonly defaultContainer = Container.createOrReuse(new Reference(`workflow/${randomUUID()}`));
 	/** Captured workflow configuration with an independent stage list. */
 	readonly options: Readonly<Omit<WorkflowOptions, "stages" | "policies"> & {
 		stages: readonly Stage[];
@@ -194,6 +183,20 @@ export class Workflow {
 			...options.policies,
 			learnings: options.policies.learnings && Object.freeze({ ...options.policies.learnings }),
 		}) });
+	}
+
+	/**
+	 * Resolves a stage binding with this workflow's resource defaults. Stages sharing a named
+	 * reference share one VM for the same task; unbound stages share a workflow-local default per task.
+	 * Distinct task identities never share a VM, even within the same workflow or run.
+	 * The consumer must supply a stable task reference with a globally unique name per execution,
+	 * including concurrent or repeated executions with matching display labels. Never pass a
+	 * workflow-run reference containing multiple tasks. Destroy each resolved VM when the task finishes.
+	 * Resolution is inert; explicitly await `vm.start()`.
+	 */
+	resolveContainer(stage: Stage, taskReference: Reference): Container.MicroVM {
+		if (!this.options.stages.includes(stage)) throw new Error("Stage does not belong to this workflow");
+		return (stage.options.container ?? this.defaultContainer)(taskReference, this.options.container.options);
 	}
 }
 
@@ -230,6 +233,8 @@ export interface StageOptions {
 	contexts: SessionContext[];
 	/** Inline instructions or a deferred file reference. */
 	instruction: string | Instruction;
+	/** Optional task-scoped container lookup; resolved explicitly by `Workflow.resolveContainer`. */
+	container?: Container.ReferenceLookup;
 	/** Return, gate, and permission policy metadata. */
 	policies?: StagePolicies;
 	/** Actions invoked explicitly by a consumer, never during construction. */
@@ -261,9 +266,77 @@ export class Stage {
 	}
 }
 
-/** Supervisor and workflows supplied to a factory definition. */
+/** A task submission before the runtime assigns an execution identity and selects a workflow. */
+export interface TaskInput {
+	/** Display title for the task. */
+	title: string;
+	/** Optional task details for the executor. */
+	description?: string;
+	/** Workflow name for runtime selection; omission leaves selection to the runtime. */
+	workflow?: string;
+}
+
+/** A runtime-resolved task with an identity unique to this execution. */
+export interface Task {
+	/** Execution-unique identity, including repeated tasks with identical titles. */
+	readonly id: string;
+	/** Display title for the task. */
+	readonly title: string;
+	/** Task description resolved by the runtime. */
+	readonly description: string;
+	/** Name of the selected workflow. */
+	readonly workflow: string;
+}
+
+/**
+ * One agent invocation prepared by a runtime such as a CLI worker. The runtime
+ * resolves instructions and task-scoped resources, and enforces the policies
+ * governing report, ask, and createTask. Definitions alone grant no capabilities.
+ */
+export interface ExecutorRequest {
+	/** Task being executed; its identity remains stable across its stages. */
+	task: Readonly<Task>;
+	/** Agent selected for this invocation. */
+	agent: Agent;
+	/** Selected workflow containing the current stage. */
+	workflow: Workflow;
+	/** Current stage and its declarative policies. */
+	stage: Stage;
+	/** Task-scoped VM from inert container lookup; executors may start it explicitly or leave it unused. */
+	container: Container.MicroVM;
+	/** Runtime-resolved workflow and stage instructions, including the agent's loaded skills. */
+	instructions: string;
+	/** Context references isolated per task by the runtime, preserving sharing within that task. */
+	contexts: readonly SessionContext[];
+	/** Runtime cancellation signal that the executor must observe. */
+	signal: AbortSignal;
+	/** Reports progress through the runtime's reporting policy. */
+	report(message: string): void;
+	/** Requests user input through the runtime, which enforces the agent's interaction policy. */
+	ask(question: string): Promise<string>;
+	/** Creates a task and returns its execution ID; the runtime must enforce stage createNewTasks permission. */
+	createTask(input: TaskInput): Promise<string>;
+}
+
+/** Optional output and routing request from one agent invocation. */
+export interface ExecutorResult {
+	/** Output produced by the executor. */
+	output?: string;
+	/** The runtime must check this target against stage.options.policies.returns before routing. */
+	returnTo?: Stage;
+}
+
+/** A caller-supplied execution strategy; factory definitions never invoke it or start a provider. */
+export interface Executor {
+	/** Executes one prepared request, owning any provider, tool execution, or VM startup it needs. */
+	execute(request: ExecutorRequest): Promise<ExecutorResult | void>;
+}
+
+/** Executor, supervisor metadata, and workflows supplied to a factory definition. */
 export interface FactoryConfig {
-	/** Supervisor definition used by a consumer. */
+	/** Required execution strategy retained by reference; no default provider is supplied. */
+	executor: Executor;
+	/** Optional supervisor policies remain descriptive until a consumer uses them. */
 	supervisor: Supervisor;
 	/** Workflows included in the definition, in supplied order. */
 	workflows: Workflow[];
@@ -271,8 +344,9 @@ export interface FactoryConfig {
 
 /** Construction API only; no scheduler, runner, or implicit side effects. */
 export const factory = {
-	/** Returns a configuration with an independent workflow list; executes nothing. */
+	/** Validates executor.execute, retains the executor instance, and copies the workflow list without executing anything. */
 	define(config: FactoryConfig): FactoryConfig {
+		if (typeof config.executor?.execute !== "function") throw new TypeError("Executor must provide an execute function");
 		return { ...config, workflows: [...config.workflows] };
 	},
 };

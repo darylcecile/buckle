@@ -3,6 +3,7 @@ import { Model, SessionContext as FactorySessionContext, type ModelOptions } fro
 import { boolean, bounded, Client, identifier, nullableText, record, text, type SessionOptions } from "./client.js";
 
 export { ApiError, type SessionOptions } from "./client.js";
+export { CopilotExecutor, type CopilotExecutorOptions } from "./copilot.js";
 
 /** Describes a GitHub model without checking availability, authenticating, or executing it. */
 export function model(id: string, options: ModelOptions): Model {

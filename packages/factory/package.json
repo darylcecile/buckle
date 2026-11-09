@@ -10,6 +10,7 @@
 	},
 	"files": ["dist", "src"],
 	"engines": { "node": ">=22" },
+	"dependencies": { "microsandbox": "0.7.14" },
 	"scripts": {
 		"build": "tsrs -p tsconfig.json",
 		"typecheck": "tsrs --noEmit -p tsconfig.json",

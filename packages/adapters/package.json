@@ -9,8 +9,8 @@
     ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" }
   },
   "files": ["dist", "src"],
-  "engines": { "node": ">=22" },
-  "dependencies": { "@buckles/factory": "workspace:^" },
+  "engines": { "node": ">=22.12.0" },
+  "dependencies": { "@buckles/factory": "workspace:^", "@github/copilot-sdk": "1.0.29" },
   "scripts": {
     "build": "tsrs -p tsconfig.json",
     "typecheck": "tsrs --noEmit -p tsconfig.json",
