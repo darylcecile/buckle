@@ -28,6 +28,9 @@ export class Runtime extends EventEmitter {
 	/** True once stop has begun, including time spent waiting for legacy hooks and cleanup. */
 	get isStopping(): boolean { return this.stopping; }
 
+	/** Workflow names in declaration order; the first is the default for new tasks. */
+	get workflows(): string[] { return this.config.workflows.map(workflow => workflow.options.name); }
+
 	/** Returns all records in submission order, including finished tasks. */
 	list(): TaskRecord[] { return structuredClone([...this.records.values()]); }
 

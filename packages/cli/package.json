@@ -1,7 +1,7 @@
 {
 	"name": "@buckles/cli",
 	"version": "1.0.0",
-	"description": "Local task runner and live terminal board for Buckles factories.",
+	"description": "Background task runner and interactive terminal UI for Buckles factories.",
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
