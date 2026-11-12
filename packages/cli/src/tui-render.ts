@@ -1,9 +1,23 @@
+import { styleText } from "node:util";
 import { terminalText } from "./board.js";
 import { selectedTask, taskActions, type TextField, type TuiState } from "./tui-state.js";
-import type { TaskRecord } from "./types.js";
+import type { TaskRecord, TaskState } from "./types.js";
 
 export interface TuiFrame { text: string; cursor?: { row: number; column: number }; scroll?: number; pageSize: number }
-interface Body { lines: string[]; cursor?: { row: number; column: number }; scroll?: number; pageSize?: number }
+type Tone = "cyan" | "green" | "yellow" | "red" | "gray" | "dim";
+interface LineStyle { tone?: Tone; bold?: boolean; state?: { value: TaskState; column: number } }
+interface Body { lines: string[]; styles?: Record<number, LineStyle>; cursor?: { row: number; column: number }; scroll?: number; pageSize?: number }
+const taskTones: Record<TaskState, Tone> = { queued: "gray", running: "cyan", waiting: "yellow", cancelling: "yellow", completed: "green", failed: "red", cancelled: "gray" };
+
+/** Called only after sanitization and clipping; all escape sequences originate in styleText. */
+function colorLine(text: string, style: LineStyle | undefined): string {
+	if (style?.state) {
+		const { value, column } = style.state;
+		text = text.slice(0, column) + styleText(taskTones[value], text.slice(column, column + value.length)) + text.slice(column + value.length);
+	}
+	if (style?.tone) text = styleText(style.tone, text);
+	return style?.bold ? styleText("bold", text) : text;
+}
 
 function clip(text: string, width: number): string {
 	const safe = terminalText(text);
@@ -21,29 +35,48 @@ export function wrapText(text: string, width: number): string[] {
 	});
 }
 
-export function taskDetailLines(task: TaskRecord, tasks: readonly TaskRecord[], width: number): string[] {
+function taskDetails(task: TaskRecord, tasks: readonly TaskRecord[], width: number): Body {
 	const lines = [task.title, `ID: ${task.id}`, `State: ${task.state}  |  Workflow: ${task.workflow}`,
 		`Stage: ${task.stage || "-"}  |  Agent: ${task.agent || "-"}  |  Visit: ${task.attempt}`,
 		`Created: ${task.createdAt}  |  Updated: ${task.updatedAt}`];
+	const styles: Record<number, LineStyle> = { 0: { bold: true }, 2: { tone: taskTones[task.state] } };
 	if (task.retryOf) lines.push(`Retry of: ${task.retryOf}`);
 	for (const retry of tasks.filter(candidate => candidate.retryOf === task.id)) lines.push(`Retried as: ${retry.id} (${retry.state})`);
+	styles[lines.length + 1] = styles[lines.length + 4] = { tone: "cyan", bold: true };
 	lines.push("", "DESCRIPTION", task.description || "(No description)", "", "ACTIVITY", task.activity || "-");
-	if (task.error) lines.push("", "ERROR", task.error);
-	if (task.cleanupErrors.length) lines.push("", "CLEANUP FAILURES", ...task.cleanupErrors);
+	if (task.error) { styles[lines.length + 1] = { tone: "red", bold: true }; lines.push("", "ERROR", task.error); }
+	if (task.cleanupErrors.length) { styles[lines.length + 1] = { tone: "red", bold: true }; lines.push("", "CLEANUP FAILURES", ...task.cleanupErrors); }
 	if (task.questions.length) {
+		styles[lines.length + 1] = { tone: "yellow", bold: true };
 		lines.push("", `QUESTIONS (${task.questions.length}; a answers the oldest)`);
 		for (const [index, question] of task.questions.entries()) lines.push(`${index + 1}. ${question.text}`, `Question ID: ${question.id}`);
 	}
+	styles[lines.length + 1] = { tone: "cyan", bold: true };
 	lines.push("", `OUTPUTS (${task.outputs.length})`);
 	if (!task.outputs.length) lines.push("No output yet.");
-	for (const output of task.outputs) lines.push("", `${output.stage} / ${output.agent} / visit ${output.attempt}`, output.text);
-	return lines.flatMap(line => wrapText(line, width));
+	for (const output of task.outputs) {
+		styles[lines.length + 1] = { tone: "dim" };
+		lines.push("", `${output.stage} / ${output.agent} / visit ${output.attempt}`, output.text);
+	}
+	const wrapped: Body = { lines: [], styles: {} };
+	for (const [index, line] of lines.entries()) for (const text of wrapText(line, width)) {
+		if (styles[index]) wrapped.styles![wrapped.lines.length] = styles[index];
+		wrapped.lines.push(text);
+	}
+	return wrapped;
 }
 
-function scrollBody(lines: string[], offset: number, height: number): Body {
+export function taskDetailLines(task: TaskRecord, tasks: readonly TaskRecord[], width: number): string[] {
+	return taskDetails(task, tasks, width).lines;
+}
+
+function scrollBody(lines: string[], offset: number, height: number, sourceStyles: Record<number, LineStyle> = {}): Body {
 	const capacity = Math.max(1, height - 1);
 	const scroll = Math.min(offset, Math.max(0, lines.length - capacity));
-	return { lines: [...lines.slice(scroll, scroll + capacity), `Lines ${scroll + 1}-${Math.min(lines.length, scroll + capacity)} of ${lines.length} | arrows / PgUp / PgDn`], scroll, pageSize: capacity };
+	const visible = lines.slice(scroll, scroll + capacity);
+	const styles: Record<number, LineStyle> = { [visible.length]: { tone: "dim" } };
+	for (let index = 0; index < visible.length; index++) if (sourceStyles[index + scroll]) styles[index] = sourceStyles[index + scroll]!;
+	return { lines: [...visible, `Lines ${scroll + 1}-${Math.min(lines.length, scroll + capacity)} of ${lines.length} | arrows / PgUp / PgDn`], styles, scroll, pageSize: capacity };
 }
 
 function preview(task: TaskRecord, width: number): string[] {
@@ -77,8 +110,19 @@ function listBody(state: TuiState, width: number, height: number): Body {
 	const start = Math.max(0, Math.min(tasks.length - capacity, index - Math.floor(capacity / 2)));
 	const visible = tasks.slice(start, start + capacity);
 	const heading = width >= 105 ? "  ID       TITLE                  STATE      STAGE        AGENT        VISIT ACTIVITY / ERROR" : "TASKS | ID / state / title; stage / agent / visit / activity";
+	const styles: Record<number, LineStyle> = { 0: { tone: "cyan", bold: true }, [1 + visible.length * perTask]: { tone: "dim" } };
+	for (const [index, task] of visible.entries()) styles[1 + index * perTask] = {
+		bold: task.id === state.selectedId,
+		state: { value: task.state, column: width >= 105 ? 34 : terminalText(task.id.slice(0, 8)).length + 4 },
+	};
+	if (tail.length) {
+		const offset = 2 + visible.length * perTask;
+		styles[offset] = { tone: "dim" };
+		styles[offset + 1] = { tone: "cyan", bold: true };
+		styles[offset + tail.length - 1] = { tone: "cyan" };
+	}
 	return { lines: [heading, ...visible.flatMap(task => taskRows(task, task.id === state.selectedId, width)),
-		`${start + 1}-${start + visible.length} of ${tasks.length} tasks | ${tasks.length - visible.length} offscreen`, ...tail], pageSize: capacity };
+		`${start + 1}-${start + visible.length} of ${tasks.length} tasks | ${tasks.length - visible.length} offscreen`, ...tail], styles, pageSize: capacity };
 }
 
 function editor(field: TextField, width: number, height: number, focused: boolean): Body {
@@ -108,7 +152,7 @@ function formBody(state: TuiState, width: number, height: number): Body {
 		const question = wrapText(form.question, width).slice(0, Math.max(1, Math.min(4, height - 4)));
 		const lines = [`ANSWER | ${form.taskId.slice(0, 8)}`, ...question, "> Answer (Enter: newline)"];
 		const input = editor(form.text, width, Math.max(1, height - lines.length), true);
-		return { lines: [...lines, ...input.lines], cursor: input.cursor && { row: lines.length + input.cursor.row, column: input.cursor.column } };
+		return { lines: [...lines, ...input.lines], styles: { 0: { tone: "cyan", bold: true }, [lines.length - 1]: { tone: "cyan", bold: true } }, cursor: input.cursor && { row: lines.length + input.cursor.row, column: input.cursor.column } };
 	}
 	const workflows = state.snapshot?.workflows ?? [];
 	const workflowIndex = workflows.indexOf(form.workflow);
@@ -116,9 +160,9 @@ function formBody(state: TuiState, width: number, height: number): Body {
 	if (height < 9) {
 		const names = ["Title", "Description", "Workflow"];
 		const heading = `NEW TASK | ${names[form.focus]} (${form.focus + 1}/3)`;
-		if (form.focus === 2) return { lines: [heading, `< ${form.workflow} >`, "Left/Right: choose workflow"] };
+		if (form.focus === 2) return { lines: [heading, `< ${form.workflow} >`, "Left/Right: choose workflow"], styles: { 0: { tone: "cyan", bold: true }, 1: { tone: "cyan", bold: true } } };
 		const input = editor(form.focus === 0 ? form.title : form.description, width, Math.max(1, height - 1), true);
-		return { lines: [heading, ...input.lines], cursor: input.cursor && { row: input.cursor.row + 1, column: input.cursor.column } };
+		return { lines: [heading, ...input.lines], styles: { 0: { tone: "cyan", bold: true } }, cursor: input.cursor && { row: input.cursor.row + 1, column: input.cursor.column } };
 	}
 	const title = editor(form.title, width, form.focus === 0 ? 2 : 1, form.focus === 0);
 	const description = editor(form.description, width, Math.max(1, height - title.lines.length - 6), form.focus === 1);
@@ -127,7 +171,10 @@ function formBody(state: TuiState, width: number, height: number): Body {
 		`${form.focus === 2 ? ">" : " "} Workflow (${workflowIndex + 1}/${workflows.length}) | Left/Right: choose`, `  < ${form.workflow} >`];
 	let cursor = title.cursor && { row: title.cursor.row + 2, column: title.cursor.column };
 	if (description.cursor) cursor = { row: description.cursor.row + title.lines.length + 3, column: description.cursor.column };
-	return { lines, cursor };
+	const styles: Record<number, LineStyle> = { 0: { tone: "cyan", bold: true } };
+	for (const [focus, row] of [1, title.lines.length + 2, lines.length - 2].entries()) styles[row] = form.focus === focus ? { tone: "cyan", bold: true } : { tone: "dim" };
+	if (form.focus === 2) styles[lines.length - 1] = { tone: "cyan", bold: true };
+	return { lines, styles, cursor };
 }
 
 const help = [
@@ -137,10 +184,12 @@ const help = [
 function bodyFor(state: TuiState, width: number, height: number): Body {
 	if (state.form) return formBody(state, width, height);
 	if (state.overlay === "help") return scrollBody(["LAST MESSAGE", state.notice, "", ...help].flatMap(line => wrapText(line, width)), state.overlayScroll, height);
-	if (state.overlay === "stop") return { lines: ["STOP DAEMON?", "", ...wrapText("This cancels queued and active work, waits for cooperative cleanup, and releases all in-memory task history.", width), "", ...wrapText("To leave work running, press q to detach instead.", width), "", "y stop daemon  |  Esc / n go back"] };
+	if (state.overlay === "stop") return { lines: ["STOP DAEMON?", "", ...wrapText("This cancels queued and active work, waits for cooperative cleanup, and releases all in-memory task history.", width), "", ...wrapText("To leave work running, press q to detach instead.", width), "", "y stop daemon  |  Esc / n go back"], styles: { 0: { tone: "yellow", bold: true } } };
 	if (state.view === "detail") {
 		const task = selectedTask(state);
-		return task ? scrollBody(taskDetailLines(task, state.snapshot?.tasks ?? [], width), state.scroll, height) : { lines: ["Selected task is not in this daemon's snapshot.", "Esc returns to the task list."] };
+		if (!task) return { lines: ["Selected task is not in this daemon's snapshot.", "Esc returns to the task list."] };
+		const detail = taskDetails(task, state.snapshot?.tasks ?? [], width);
+		return scrollBody(detail.lines, state.scroll, height, detail.styles);
 	}
 	return listBody(state, width, height);
 }
@@ -156,8 +205,8 @@ function footerLines(state: TuiState, width: number): string[] {
 	return keys.flatMap(line => wrapText(line, width));
 }
 
-/** Produces a bounded frame; only the terminal driver emits control sequences. */
-export function renderTui(state: TuiState, columns = 100, rows = 24): TuiFrame {
+/** Produces a bounded frame. Optional color is applied after safe layout and respects Node's terminal/color detection. */
+export function renderTui(state: TuiState, columns = 100, rows = 24, color = false): TuiFrame {
 	const width = Math.max(1, Math.floor(columns) - 1);
 	const height = Math.max(1, Math.floor(rows));
 	const stopping = state.stopRequested || state.snapshot?.stopping;
@@ -172,5 +221,14 @@ export function renderTui(state: TuiState, columns = 100, rows = 24): TuiFrame {
 	while (lines.length < header.length + bodyHeight) lines.push("");
 	lines.push(...notice, ...footer);
 	const cursor = body.cursor && body.cursor.row < bodyHeight ? { row: header.length + body.cursor.row, column: Math.min(width - 1, body.cursor.column) } : undefined;
-	return { text: lines.slice(0, height).map(line => clip(line, width)).join("\n"), cursor, scroll: body.scroll, pageSize: body.pageSize ?? Math.max(1, bodyHeight - 1) };
+	const styles: Record<number, LineStyle> = { 0: { tone: state.connection === "disconnected" ? "red" : stopping ? "yellow" : state.connection === "connected" ? "green" : "cyan", bold: true } };
+	if (header.length > 1) styles[1] = { tone: "dim" };
+	for (const [row, style] of Object.entries(body.styles ?? {})) if (Number(row) < bodyHeight) styles[header.length + Number(row)] = style;
+	const noticeStart = header.length + bodyHeight;
+	for (let index = 0; index < notice.length; index++) styles[noticeStart + index] = { tone: state.notice.startsWith("Error:") || state.connection === "disconnected" ? "red" : stopping ? "yellow" : "dim" };
+	for (let index = 0; index < footer.length; index++) styles[noticeStart + notice.length + index] = { tone: "cyan" };
+	return { text: lines.slice(0, height).map((line, index) => {
+		const safe = clip(line, width);
+		return color ? colorLine(safe, styles[index]) : safe;
+	}).join("\n"), cursor, scroll: body.scroll, pageSize: body.pageSize ?? Math.max(1, bodyHeight - 1) };
 }

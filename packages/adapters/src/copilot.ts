@@ -181,13 +181,13 @@ export class CopilotExecutor implements Executor {
 			const beforeCleanup = errors.length;
 			if (session) {
 				await cleanup(() => session!.disconnect());
-				await cleanup(() => client!.deleteSession(session!.sessionId));
 			}
 			if (client) {
 				await cleanup(async () => { errors.push(...await client!.stop()); });
 				if (errors.length > beforeCleanup) await cleanup(() => client!.forceStop());
 			}
 			await work?.catch(() => undefined);
+			// Remove configDirectory's persisted session state after the client shuts down.
 			if (directory) await cleanup(() => rm(directory!, { recursive: true, force: true }));
 		}
 		if (errors.length > 1) throw new AggregateError(errors.map(error => this.safeError(error)), "Copilot execution or cleanup failed");

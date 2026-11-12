@@ -72,7 +72,7 @@ export async function runTui(file: string): Promise<void> {
 		repaint = undefined;
 		if (closed) return;
 		try {
-			const frame = renderTui(state, output.columns, output.rows);
+			const frame = renderTui(state, output.columns, output.rows, true);
 			pageSize = frame.pageSize;
 			if (frame.scroll !== undefined) {
 				if (state.overlay === "help") state.overlayScroll = frame.scroll;

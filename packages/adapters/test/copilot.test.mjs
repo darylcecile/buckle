@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
-import { access } from "node:fs/promises";
+import { access, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { inspect } from "node:util";
 import { setImmediate } from "node:timers/promises";
 import test from "node:test";
@@ -33,7 +34,7 @@ function request(options = {}) {
 }
 
 function sdkDriver(context, dispatch, options = {}) {
-	const observed = { files: new Map(), commands: [], starts: 0, aborts: 0, disconnects: 0, stops: 0, forces: 0, deleted: [], destroys: 0 };
+	const observed = { files: new Map(), commands: [], starts: 0, aborts: 0, disconnects: 0, stops: 0, forces: 0, destroys: 0 };
 	context.mock.method(microsandbox, "load", async () => ({
 		defaultBackendKind: () => "local",
 		Sandbox: { builder(name) {
@@ -84,7 +85,6 @@ function sdkDriver(context, dispatch, options = {}) {
 			start: async () => { if (options.startError) throw options.startError; },
 			listModels: async () => options.models ?? [model],
 			createSession: async config => { observed.sessionConfiguration = config; return session; },
-			deleteSession: async id => { observed.deleted.push(id); },
 			stop: async () => { observed.stops++; return options.stopErrors ?? []; },
 			forceStop: async () => { observed.forces++; },
 		};
@@ -99,7 +99,11 @@ function value(result) {
 
 test("dispatch uses the selected task VM, declared contexts and real runtime callbacks, then returns explicit completion", async context => {
 	const task = request();
-	const observed = sdkDriver(context, async ({ call }) => {
+	const observed = sdkDriver(context, async ({ call, observed }) => {
+		assert.equal(observed.sessionConfiguration.configDirectory, observed.clientConfiguration.workingDirectory);
+		const sessionDirectory = join(observed.sessionConfiguration.configDirectory, "session-state", "owned-session");
+		await mkdir(sessionDirectory, { recursive: true });
+		await writeFile(join(sessionDirectory, "events.jsonl"), '{"type":"session.start"}\n');
 		value(await call("guest_write", { path: "result.txt", content: "from the guest" }));
 		assert.equal(value(await call("guest_read", { path: "result.txt" })), "from the guest");
 		assert.deepEqual(value(await call("guest_exec", { command: "run-checks" })), { exitCode: 7, stdout: "guest stdout", stderr: "guest stderr" });
@@ -127,7 +131,6 @@ test("dispatch uses the selected task VM, declared contexts and real runtime cal
 	assert.equal(observed.files.has("/workspace/late.txt"), false);
 	assert.equal(observed.disconnects, 1);
 	assert.equal(observed.stops, 1);
-	assert.deepEqual(observed.deleted, ["owned-session"]);
 	assert.equal(observed.destroys, 0);
 	assert.equal(task.invocation.container.state, "running");
 	await assert.rejects(access(observed.clientConfiguration.workingDirectory), { code: "ENOENT" });
