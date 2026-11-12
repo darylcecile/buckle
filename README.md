@@ -1,254 +1,245 @@
 # Buckles
 
-Four published ESM packages for defining and running agent workflows and explicitly managing their resources:
+Buckles lets you define agent workflows in TypeScript or JavaScript and run them from your terminal. Compose agents into ordered stages, share context between them, and add explicit checks and actions. The CLI runs submitted tasks in the background while you follow progress in an interactive terminal UI.
 
-- `@buckles/factory`: agents, workflows, stages, deferred prompt files, shared contexts, model descriptors, and local MicroVMs.
-- `@buckles/adapters`: the explicit Copilot executor, GitHub model descriptors, PR snapshots, polling gates, approval, and direct merge actions.
-- `@buckles/utils`: duration helpers for configuration.
-- `@buckles/cli`: background task scheduling, isolated execution, and an interactive terminal UI.
+A **factory** brings together an executor and one or more workflows. Each **workflow** contains **stages**, and each stage assigns work to **agents**. Defining these components does not execute them: the CLI starts work only when you submit a task.
 
-Use Node.js 22.12+ for development, the [CLI](packages/cli/package.json), and the Copilot SDK executor; the core MicroVM API alone retains its Node.js 22+ minimum. Development also requires pnpm 10. The workspace root is a private fifth workspace importer, not a fifth published package. Packages export compiled JavaScript, declarations with JSDoc, and source/declaration maps. `Model` and `ModelOptions` belong to factory and are re-exported as adapter types; adapters and CLI depend on factory, never the reverse.
+## Requirements
 
-## Development
+- **Node.js 22.12+**, **pnpm 10**, and **Git** for the source installation below. The CLI supports macOS and Linux. See the [Node.js](https://nodejs.org/en/download) and [pnpm](https://pnpm.io/installation) installation guides if needed.
+- **Copilot access** for workflows using `Github.CopilotExecutor`, including a model and reasoning effort available to your account. Authenticate on the host using the [Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli), or supply a `copilotToken` in trusted executor configuration.
+- **Local virtualization** for Copilot task MicroVMs: Apple Silicon macOS or Linux with KVM. Keep optional package dependencies enabled; they supply the Copilot runtime and native microsandbox components. No separate microsandbox daemon is required. See [Local MicroVMs](#local-microvms) for platform details.
+
+You can build the packages and load a factory without Copilot credentials or a running VM. Submitting a task to the Copilot executor requires both.
+
+## Install from source
 
 ```sh
+git clone https://github.com/darylcecile/buckle.git
+cd buckle
 pnpm install
 pnpm build
-pnpm typecheck
-pnpm test
+pnpm cli --help
 ```
 
-`pnpm typecheck` builds the packages and checks the example against their real exported declarations. `pnpm test` runs Node tests with mocked GitHub/Copilot transports and microsandbox boundaries, local CLI worker checks, and the real example import smoke test. These checks do not call models or boot VMs. After building, `pnpm test:example` reruns just the import smoke test. `tsx` is a runtime dependency of `@buckles/cli` for loading consumer TypeScript factories, including extensionless imports. The private root also uses it for the example import test.
+Run the commands in this guide from the cloned repository root. `pnpm cli` runs the built CLI directly, so it works on a first source build without a global installation. The CLI package's executable is named `buckles`; the arguments are the same. These instructions do not depend on the packages being available on npm.
 
-## CLI
+## Quick start
 
-`@buckles/cli` is the execution consumer for the inert `@buckles/factory` definitions. It provides the `buckles` executable on macOS and Linux (Node.js 22.12+). After workspace installation and build:
+1. Save the [starter factory below](#defining-a-factory) as `factory.ts` in the repository root. Replace its model ID and reasoning effort placeholders with values supported by your Copilot account.
+2. Authenticate Copilot on the host. The executor uses stored login from `COPILOT_HOME` or `~/.copilot` by default; `GITHUB_TOKEN` is not a substitute for Copilot authentication.
+3. Start the factory and open the TUI:
 
 ```sh
-pnpm exec buckles run example/factory.ts
+pnpm cli run factory.ts
 ```
 
-This starts a background daemon (or attaches to the existing one) and opens the TUI. No second terminal is needed: use **n** to create a task, arrows to select it, **Enter** for details, **a** to answer its pending question, **c** to cancel, and **r** to retry a failed task. Details include progress, questions, retained results and cleanup errors. **?** shows help. **q** or **Ctrl-C** detaches, leaving tasks running; **s then y** confirms stopping the daemon and waits for cleanup. Run the same command again to reconnect with the retained task history.
+Press **n** to add a task such as "Outline a release checklist". The starter drafts an outline and reviews it, sharing the draft through a context. It has no GitHub approval or merge actions. Starting the daemon alone does not call a model or boot a VM.
 
-In forms, **Tab / Shift-Tab** changes fields, arrows edit text or select a workflow, **Enter** adds a newline in descriptions/answers, **Ctrl-S** submits, and **Esc** discards the draft.
+Use arrows to select a task and **Enter** for details, **a** to answer a pending question, **c** to cancel, and **r** to retry a failed task. **?** shows help. In forms, **Tab / Shift-Tab** changes fields, arrows edit text or select a workflow, **Enter** inserts description/answer newlines, **Ctrl-S** submits, and **Esc** discards the draft.
 
-For scripts or a daemon without the TUI:
+**q** or **Ctrl-C** detaches without stopping tasks. Run the same command to reconnect. **s then y** confirms stopping the daemon and waits for cleanup. Task history lives only in daemon memory: export results before stopping if you need them later.
+
+The larger [example factory](example/factory.ts) shows Todo, Triage & Plan, Implementation, Checks, Review, Merge, and Done. You can open it with `pnpm cli run example/factory.ts`, but review its [stages](example/stages.ts) and [agents](example/agents.ts) before submitting work: it includes real approval/merge hooks, account-specific model choices, and GitHub binding requirements. It does **not** automatically populate the guest with your repository or provide PR publication.
+
+## CLI commands
+
+Use `pnpm cli --help` for the built-in reference. Every command accepts `--factory <file>`. Without a path, the CLI looks for `factory.ts`, then `example/factory.ts`, in the current directory. Use the same factory path for all commands targeting a daemon.
+
+| Command after `pnpm cli` | What it does |
+| --- | --- |
+| `run [factory]` | Start or attach to a daemon and open the TUI. This is also the default with no command. |
+| `tui [factory]` | Start or attach with an interactive terminal required. |
+| `start [factory] [--json]` | Start or reuse the daemon without opening the TUI; print status including its PID. |
+| `status [--json]` | Read daemon state without starting it. |
+| `add "title" [--description "text"] [--workflow "name"]` | Submit a task; the first declared workflow is the default. |
+| `list [--json]` | List all retained tasks. |
+| `show <id> [--json]` | Print the complete task record as JSON, including outputs, errors, and pending questions. |
+| `answer <id> "text"` | Answer the task's oldest pending question. |
+| `retry <id>` | Create a new execution of a failed task, from the beginning. |
+| `cancel <id>` | Request cooperative cancellation. |
+| `stop` | Stop accepting tasks, cancel queued/active work, and wait for cleanup. |
+
+`run`, `tui`, and `start` accept a positional factory path **or** `--factory`, not both. Task commands also accept `--json`. IDs may be full UUIDs or unambiguous prefixes. `retry` creates a new UUID with a `retryOf` link; it does not resume a failed phase. Check uncertain external effects before retrying so successful mutations are not repeated.
+
+For a non-interactive session using the starter factory:
 
 ```sh
-pnpm exec buckles start example/factory.ts
-pnpm exec buckles status --json
-pnpm exec buckles add "Fix the failing check" --description "Investigate and repair the reported failure"
-pnpm exec buckles list
-pnpm exec buckles show <task-id> --json
-pnpm exec buckles answer <task-id> "Proceed with the proposed change"
-pnpm exec buckles cancel <task-id>
-pnpm exec buckles retry <failed-task-id>
-pnpm exec buckles stop
+pnpm cli start factory.ts
+pnpm cli add "Outline a release checklist" --workflow "Writing"
+pnpm cli list
 ```
 
-`pnpm cli ...` is also available from the repository root and directly runs the built entry point. Every command accepts `--factory <file>`. Without a path, resolution checks `factory.ts`, then [example/factory.ts](example/factory.ts), in the current directory; this repository still defaults to the example. `buckles` without a command is equivalent to `buckles run`. `run`, `tui` and `start` accept an optional positional path instead of `--factory`. An explicit path avoids ambiguity when operating elsewhere. `start` prints the daemon PID; `status` reads its current state without starting it. Both support `--json`. `add --workflow "name"` selects a workflow; omission selects the first declared workflow. Full UUIDs and unambiguous ID prefixes are accepted. `--json` also works with task commands; `show` always prints the complete JSON record, including outputs, errors, pending questions and any `retryOf` link.
+Inspect a task with `pnpm cli show <task-id>` (replace `<task-id>` with its actual ID). Use `pnpm --silent cli list --json` to export history without pnpm's script banner, then `pnpm cli stop` when finished.
 
-The TUI refreshes read-only task snapshots about every half second. It requires interactive stdin and stdout and `TERM` other than `dumb`. Redirected `run` starts/reuses the daemon, prints status and an attach instruction, then returns without terminal escape sequences; explicit `tui` reports an error in that environment. `list` remains a complete, non-interactive board. The TUI uses terminal-palette colors for task/service states, headings and focused fields, with bold selection. It respects Node's terminal support and `NO_COLOR`, `NODE_DISABLE_COLORS` and `FORCE_COLOR` settings; plain rendering retains the same labels and selection marker. `list` and JSON remain uncolored. Colors are applied only after untrusted terminal control sequences have been neutralized and text has been fitted to the screen. Non-ASCII characters are replaced with `?` in terminal views; JSON escapes and preserves the original text. Executor output is retained for details and `show`, while `report()` supplies activity updates; daemon and worker stdout/stderr are not forwarded or saved to log files. Do not put credentials in task text, reports or executor results.
+The TUI requires interactive stdin/stdout and `TERM` other than `dumb`. Redirected `run` prints status and an attach instruction, then returns; explicit `tui` fails without a TTY. Terminal views neutralize control sequences and replace non-ASCII text with `?`; JSON preserves the original text using escapes. Colors respect terminal support, `NO_COLOR`, `NODE_DISABLE_COLORS`, and `FORCE_COLOR`; plain views retain labels and selection markers. Executor output is retained in task details, not forwarded to daemon/worker log files. **Never put credentials in task text, reports, or results.**
 
-### Execution and Policies
+## Defining a factory
 
-- The factory's default export must provide an explicit `executor.execute(request)` through `factory.define({ executor, supervisor, workflows })`. Starting the daemon only loads the definition and waits for submissions; it never invokes agents without tasks. The detached Node process inherits the launcher's working directory and environment; reconnecting does not replace that environment. TS/JS imports use the [tsx programmatic loader](https://tsx.hirok.io/dev-api/ts-import). Treat factory modules and their imports as trusted executable code, and keep construction inert.
-- Each task runs in a fresh [Node child process](https://nodejs.org/docs/latest-v22.x/api/child_process.html#child_processforkmodulepath-args-options). The child independently imports the factory, preserving real context instances and hook closures while isolating module globals from other tasks. Only task data and small progress messages cross IPC. After the pipeline and VM cleanup settle and the final outcome's IPC send callback succeeds, the owned worker disconnects and exits, so idle executor/native handles cannot retain a completed task slot. Failed outcomes and transport failures remain failures. Parent configuration supplies workflow metadata; restart the owner after changing a definition so metadata and child imports agree.
-- Workflow concurrency is independent per workflow, defaults to 1, and must be a positive safe integer. Waiting and cancelling tasks occupy their slot until their worker exits. The parent never invokes its own executor or hooks.
-- Stage order is **beforeAgents hooks -> agents in declaration order -> gates -> afterAgents hooks -> next stage**. Gates deliberately run before afterAgents mutations such as approval/merge. Every promise returned in a hook/gate batch is awaited, including after a sibling rejects. A failed stage stops the task; it is never reported completed and no automatic failure replay occurs. Callbacks must return all work they start; synchronous throws after launching unreturned work cannot be drained by the runtime.
-- Workflow/stage instruction references and agent skill references load relative to the factory file's directory. The executor receives the combined text, actual task, stage/context instances, and an inert task-scoped VM. The executor owns VM startup. One execution-unique task `Reference` is reused across stages and returns; all distinct resolved VMs are destroyed on completion, failure or cooperative cancellation. Cleanup failures include the VM name/ID and make the task fail.
-- An executor's `returnTo` must be the same stage instance present in both this workflow and the current stage's declared `policies.returns()`. A valid return skips remaining agents, gates and afterAgents in the returning stage, then re-enters the target's beforeAgents phase. Declared returns can replay earlier stages and hooks; use them only where that replay is intended. Total return transitions are bounded by `maxRetries` (default 2; explicit 0 forbids returns), a nonnegative safe integer. The board's attempt is the visit count for the current stage, not a model/provider retry counter.
-- `ask()` is allowed only for interactive agents. The task becomes `waiting`; `answer` supplies the oldest pending question's response without retaining that answer separately. `createTask()` is allowed only with `stage.options.policies.permissions.createNewTasks: true`; it queues a real task and returns its ID, not its eventual result.
-- `retry` is an explicit **new execution from the beginning**, with a fresh UUID, process, contexts and VMs, linked to the retained failed record. It does not resume a failed phase. Reconcile uncertain external effects and cleanup failures before requesting it; successful mutations may otherwise be repeated.
-- `cancel`, `stop`, and SIGINT/SIGTERM sent directly to the **daemon PID** are cooperative. Ctrl-C in the TUI only detaches. Executors receive an `AbortSignal`; legacy hook/gate callbacks do not, so they must settle before cleanup. Pending questions are cleared and the task remains `cancelling` during this wait. An abort arriving only during cleanup does not undo successfully completed stages; a cleanup failure still fails the task. `stop` refuses new tasks, cancels queued/active tasks, and waits for cleanup and worker exit without force-killing active work. Disconnecting a client during stop leaves that shutdown in progress. A non-cooperative executor or hanging hook can therefore delay shutdown. An abrupt worker exit marks the task failed, advances its queue, and explicitly reports unconfirmed VM cleanup. Recorded cleanup failures make the daemon and `stop` (including `--json`) exit nonzero, even after a later manual retry succeeds.
-
-### Local State and Limits
-
-One daemon listens on a [Unix socket](https://nodejs.org/docs/latest-v22.x/api/net.html#ipc-support) keyed by the canonical factory path, under `/tmp/buckles-<uid>` (directory mode `0700`, socket mode `0600`). There is no TCP listener or saved authentication secret. Other users cannot access it through filesystem permissions; processes running as your own user remain trusted. Concurrent starts attach to the same owner. Startup is bounded and reports loading/socket errors; permission errors and stale, unresponsive or incompatible owners are reported instead of replaced. Existing sockets are never automatically unlinked; verify the previous owner and its resources are stopped before manual removal. A legacy foreground owner must be stopped using its original CLI before starting the new daemon. Different canonical factory paths may run independently.
-
-Tasks, questions, errors and outputs are in memory until the daemon stops, independent of any attached terminal. There are no checkpoints, persistence, OS service installation or restart recovery; stopping or losing the daemon releases that history. Export `list --json` / `show --json` before stopping if results are needed later. Reconnecting reads current state and never automatically replays commands whose result was uncertain. `supervisor`, `wakeupInterval` and learning policies remain descriptive metadata: this CLI does not invent autonomous work, learning decisions or merging policy, and does not use wakeup intervals as display refresh intervals. GitHub mutations occur only through explicitly configured hooks/executors.
-
-The package exports its documented runtime, pipeline, loader, renderer, `ensureDaemon`, `runTui`, `readSnapshot`, and IPC types/helpers from `@buckles/cli`. Focused checks are `pnpm --filter @buckles/cli build` and `node --test packages/cli/test/*.test.mjs`; they do not call models or boot native VMs.
-
-## Copilot Executor
-
-Select the executor explicitly, as in [example/factory.ts](example/factory.ts). For a factory at the repository root:
+Save this as `factory.ts` at the repository root. It is a complete two-stage definition; replace `YOUR_MODEL_ID` and `YOUR_REASONING_EFFORT` before submitting tasks. Model availability is checked at execution, with no guessed aliases or fallback.
 
 ```ts
+import {
+  Agent, Container, SessionContext, Stage, Supervisor, Workflow, factory,
+} from "@buckles/factory";
 import { Github } from "@buckles/adapters";
-import { factory, Supervisor } from "@buckles/factory";
-import { mainWorkflow } from "./example/workflows";
+
+const draft = new SessionContext({ description: "The outline and review feedback." });
+const writer = new Agent({
+  name: "Writer",
+  role: "research",
+  model: Github.model("YOUR_MODEL_ID", { variant: "YOUR_REASONING_EFFORT" }),
+  mode: "interactive",
+});
+
+const outline = new Stage({
+  name: "Outline",
+  agents: [writer],
+  contexts: [draft.expectWrite()],
+  instruction: "Draft an outline for the task. Save it in the shared context, using any review feedback.",
+});
+
+const review = new Stage({
+  name: "Review",
+  agents: [writer.with({ name: "Reviewer", role: "reviewer", mode: "self-driving" })],
+  contexts: [draft.expectWrite()],
+  instruction: "Read the outline. Save feedback and return to Outline if needed; otherwise summarize the result.",
+  policies: { returns: () => [outline] },
+});
+
+const writing = new Workflow({
+  name: "Writing",
+  container: new Container.MicroVM({ image: "alpine:3.22", cpu: 1, memory: "512MiB" }),
+  instruction: "Create a useful outline without changing repositories or contacting GitHub.",
+  policies: { concurrency: 1, maxRetries: 2 },
+  stages: [outline, review],
+});
 
 export default factory.define({
   supervisor: new Supervisor({}),
-  workflows: [mainWorkflow],
-  executor: new Github.CopilotExecutor({
-    cwd: "/workspace",
-    repositories: process.env.GITHUB_REPOSITORY ? [process.env.GITHUB_REPOSITORY] : [],
-    githubToken: process.env.GITHUB_TOKEN,
-  }),
+  workflows: [writing],
+  executor: new Github.CopilotExecutor({}),
 });
 ```
 
-[CopilotExecutor](packages/adapters/src/copilot.ts) imports and construction are inert: they do not load the SDK, authenticate, read prompt files, or start a VM. Execution requires Copilot access through an authenticated stored login, or a separately supplied `copilotToken`. Stored login defaults to `COPILOT_HOME` or `~/.copilot`; `baseDirectory` can select another absolute login/data directory. Keep optional dependencies enabled for the SDK's bundled runtime; `cliPath` can select a custom runtime executable instead.
+### The building blocks
 
-`githubToken` is a separate host-only REST credential, not Copilot authentication. The executor excludes `GH_TOKEN`, `GITHUB_TOKEN` and `COPILOT_GITHUB_TOKEN` from the SDK's inherited environment. For **model-selected PR binding only**, the example requires both explicit `GITHUB_REPOSITORY=owner/repo` and `GITHUB_TOKEN`. Its `repositories?: readonly string[]` allowlist accepts exact case-insensitive `owner/repo` entries, not URLs or wildcards, and defaults to empty: a token alone does not enable [bind_github](packages/adapters/src/copilot-tools.ts). Host-bound GitHub contexts remain supported and use their own explicit credentials. Binding neither fetches a checkout nor uploads credentials to the guest.
+| Component | What to configure |
+| --- | --- |
+| `factory.define` | A default-exported configuration with an explicit `executor`, `supervisor`, and `workflows`. |
+| `Executor` | The strategy implementing `execute(request)`. `Github.CopilotExecutor` supplies Copilot and guest tools; a custom executor can replace it. The CLI never infers one from model metadata. |
+| `Workflow` | A name, ordered stages, shared instruction, container resource template, and policies. Concurrency is per workflow. |
+| `Stage` | Agents, attached contexts, instructions, optional container binding, hooks, and policies. An empty agent list is allowed for hook-only stages. |
+| `Agent` | Name, role, model, optional skills, and interaction mode. `self-driving` is the default; only `interactive` agents can ask the user questions. |
+| `SessionContext` | Shared in-memory data for stages within a task. Pass the same instance to stages that need that state. |
+| `Supervisor` | Optional model and wakeup metadata. `new Supervisor({})` is valid; the CLI does not use it to generate autonomous work. |
 
-At execution, the adapter validates the exact `Github.model(id, { variant })` against the authenticated provider's model list and advertised reasoning efforts. An unavailable/disabled model or unsupported variant fails explicitly; there is no alias guessing or fallback. Model descriptors in the example are configuration, not a claim that the authenticated account has access.
+Configuration exposes `.options`. `Agent.with()` creates a new agent with selected overrides; a supplied skill list replaces, rather than appends to, the original. `Github.model(id, { variant })` is an immutable descriptor, not an authenticated client. `Intervals.minutes(5)` and the other duration helpers in `@buckles/utils` convert values to milliseconds; they do not schedule timers. Wakeup and learning policies remain descriptive metadata in this CLI.
 
-The guest working directory defaults to `/workspace`, created if absent and empty unless the image or earlier stages supply content. No host checkout, environment or credentials are uploaded. Supply required tooling and source through the image or explicit guest commands; running a task does not populate the repository automatically. Guest command/file tools operate in the task VM; the adapter exposes only its declared tools, requires `complete_stage` for success, and cleans up its provider session/client before returning. The CLI then destroys resolved task VMs.
+### Prompt files and contexts
 
-A custom [Executor](packages/factory/src/index.ts) implementing `execute(request)` can replace CopilotExecutor in the same factory configuration; the CLI does not infer a provider from model metadata. The tests use mocked provider/VM boundaries and local child processes. They do not demonstrate a real model invocation or a live VM workflow run.
+Keep short instructions inline, as above, or move reusable prompts into files. Paths resolve relative to the **factory file's directory**, not the module that declares the stage or agent:
 
-## Definitions, Not Execution
+| Definition | File loaded by the CLI |
+| --- | --- |
+| `Instruction.fromFile("workflow")` | `instructions/workflow.md` |
+| `Instruction.fromFile("checks.md")` | `instructions/checks.md` |
+| `Skill.fromFile("writing")` | `skills/writing/SKILL.md` |
 
-See [example/factory.ts](example/factory.ts) for the complete seven-stage configuration. `factory.define()` constructs configuration only; importing the factory module does not start workflows, authenticate, or boot VMs. `@buckles/cli` runs submitted tasks using the explicitly supplied executor. The CLI enforces concurrency, return-transition budgets and task-creation permissions; factory definitions themselves do not schedule or enforce those policies. Hooks own GitHub mutation decisions, the executor owns agent/provider work and VM startup, and the CLI owns task VM cleanup. Supervisor, wakeup and learning metadata do not imply an autonomous scheduler.
+Import `Instruction` and `Skill` from `@buckles/factory`. Use an instruction reference in a workflow or stage's `instruction` field, and skill references in an agent's `skills: [Skill.fromFile("writing")]`. Explicit paths containing separators resolve against the factory directory; absolute paths are used directly. References are deferred: construction does not read files, while `.load(absoluteBaseDirectory)` reads UTF-8 and propagates errors. There is no prompt parser, cache, or file sandbox; load only trusted references.
 
-Configuration classes expose `.options`. Arrays and nested policy objects are captured independently; callbacks and context identities are preserved. `Agent.with()` returns a new agent, preserving unspecified options; supplied skill lists replace rather than append. Agents default to `self-driving`.
+Contexts expose a `.data` map and stable `.id`. `expectWrite()` creates a reference sharing the same data/identity and marking a write expectation, **not** granting or restricting access. A stage only receives its declared contexts; explicitly store information needed by later stages in a shared context. Custom subclasses must implement `createReference()` with real constructed instances and shared session state, not shallow-copy private fields.
 
-`Github.model(id, { variant })` returns an immutable model descriptor with `.provider`, `.id`, and `.options.variant`. It performs no authentication or availability check.
+See [example/context.ts](example/context.ts), [instructions](example/instructions), and [skills](example/skills) for a multi-file layout. If you move a factory, move or adjust its prompt paths too.
 
-`Supervisor` accepts optional `model` and `wakeupInterval` metadata and still accepts `{}`. `Intervals.milliseconds/seconds/minutes/hours/days` from `@buckles/utils` convert finite, nonnegative values to milliseconds; fractions are retained and days mean exactly 24 hours. Neither API schedules timers.
+### Stage order, returns, and hooks
 
-## Local MicroVMs
+The CLI executes each stage in this order:
 
-`Container.MicroVM` uses the official embedded [microsandbox 0.7.14 SDK](https://github.com/superradcompany/microsandbox/tree/v0.7.14/sdk/node-ts). No daemon setup is required. Native execution requires Node.js 22+ and Apple Silicon macOS, Linux with KVM, or Windows 11 with WHP (preview). Keep package-manager optional dependencies enabled: the platform package supplies the native addon and runtime. See the [versioned SDK requirements and runtime precedence](https://github.com/superradcompany/microsandbox/tree/v0.7.14/sdk/node-ts#runtime-notes). This wrapper rejects a cloud default backend instead of changing process-global SDK configuration.
+```text
+beforeAgents hooks -> agents in declaration order -> gates -> afterAgents hooks -> next stage
+```
 
-Construction and workflow resolution are inert, including native-addon loading. `start()` creates a uniquely named local VM from an OCI image. Explicit names are allowed but never replace or attach to another sandbox. CPU allocations must be positive safe integers. `MB`/`GB` are decimal; `MiB`/`GiB` are binary, rounded up to whole MiB (`16GB` is 15259 MiB; `16GiB` is 16384 MiB). Platform resource limits are enforced by the SDK.
+Use `policies.gates: () => [promise, ...]` for requirements that must pass, and `hooks.beforeAgents` / `hooks.afterAgents` for explicit actions. Gates run before after-agent mutations such as approval or merge. Return all work started by a callback: the CLI awaits every returned promise in a batch, even after one rejects, but cannot drain unreturned work. A failed stage stops the task; it is not automatically replayed.
+
+The starter's review can return only to its declared `outline` stage. A custom executor returns `{ returnTo: outline }`; Copilot uses `complete_stage` with the exact permitted stage name. The target must be the same stage instance in both the workflow and the current stage's `policies.returns()`. A return skips the current stage's remaining agents, gates, and after-agent hooks, then re-enters the target's before-agent hooks. Design replayed hooks accordingly.
+
+`maxRetries` bounds **total return transitions**, not provider retries (default 2; 0 forbids returns). Concurrency defaults to 1; both values must be safe integers, with concurrency positive and `maxRetries` nonnegative. Waiting/cancelling tasks occupy their slot until their worker exits. The displayed attempt is the current stage's visit count. Creating additional tasks requires `policies.permissions.createNewTasks: true`; `createTask()` queues work and returns its ID, not its result. Merely defining a stage or writing instructions does not schedule it or grant capabilities.
+
+## Runtime and safety reference
+
+### Execution and local state
+
+Treat factory modules and all their imports as **trusted host code**. Keep construction inert. Each task imports the factory in a fresh Node child process, isolating module globals while preserving context instances and hook closures within that task. The daemon inherits the launcher's directory/environment; reconnecting does not replace them. Stop and restart after configuration or environment changes so daemon metadata and worker imports agree.
+
+One daemon is keyed by each canonical factory path, using a Unix socket under `/tmp/buckles-<uid>` (directory mode `0700`, socket mode `0600`). There is no TCP listener or saved authentication secret; processes running as your own user remain trusted. Concurrent starts attach to the same owner. Loading, permission, stale-owner, and protocol errors are reported, not silently replaced. Never remove a socket until you have verified its owner and resources are stopped. A legacy foreground owner must be stopped with its original CLI.
+
+Tasks, questions, errors, and outputs are **in memory only** until the daemon stops. There are no checkpoints, restart recovery, or installed OS services. Reconnection does not replay commands with uncertain outcomes. Export `list --json` or `show --json` before shutdown if results matter.
+
+Cancellation is cooperative. `cancel`, `stop`, and SIGINT/SIGTERM sent to the **daemon PID** signal executors and wait for hooks, gates, VM cleanup, and worker exit; Ctrl-C in the TUI only detaches. Pending questions are cleared. A non-cooperative executor or hanging hook can delay shutdown; active work is not force-killed. Cancellation arriving only during cleanup does not undo completed stages. Cleanup failures fail the task and make daemon/`stop` exit nonzero, even if a later retry succeeds. Abrupt worker exit reports unconfirmed VM cleanup rather than claiming success.
+
+### Copilot executor
+
+[CopilotExecutor options](packages/adapters/src/copilot.ts) separate provider authentication from GitHub REST credentials. `copilotToken` authenticates Copilot; otherwise stored login is used. `baseDirectory` selects an absolute login/data directory, and `cliPath` can select a custom runtime executable. The executor excludes `GH_TOKEN`, `GITHUB_TOKEN`, and `COPILOT_GITHUB_TOKEN` from the SDK's inherited environment. Keep secrets in trusted host configuration, never task text or source control.
+
+For **model-selected binding to an existing PR**, explicitly configure both a host REST token and an exact repository allowlist. This is the pattern used in [example/factory.ts](example/factory.ts):
 
 ```ts
-import { Container } from "@buckles/factory";
-
-const vm = new Container.MicroVM({
-  image: "alpine:3.22", cpu: 1, memory: "512MiB",
-  network: network => network
-    .portBind("127.0.0.1", 18080, 8080)
-    .policy({ defaultIngress: "allow", defaultEgress: "allow", rules: [] }),
+new Github.CopilotExecutor({
+  githubToken: process.env.GITHUB_TOKEN,
+  repositories: process.env.GITHUB_REPOSITORY ? [process.env.GITHUB_REPOSITORY] : [],
 });
-
-try {
-  await vm.start();
-  const result = await vm.exec("sh", ["-c", "printf hello"], { timeoutMs: 5000 });
-  console.log(result.code, result.stdout(), result.stderr());
-  await vm.fs().write("/tmp/message", "hello");
-  await vm.download("/tmp/message", "./message.txt");
-  await vm.upload("./message.txt", "/tmp/copied-message");
-  await vm.pause();
-  await vm.resume();
-  await vm.stop();
-  await vm.start();
-} finally {
-  await vm.destroy();
-}
 ```
 
-- `exec(command, args, { cwd?, env?, timeoutMs? })` returns the SDK's `ExecOutput`: `.code`, `.success`, `.stdout()`/`.stderr()`, and binary `.stdoutBytes()`/`.stderrBytes()`. Nonzero command exit is a result, not a successful-work assertion. Transport and timeout failures reject. The default execution budget is 30000ms.
-- `execStream` accepts the same arguments and returns the official stream handle for output events, collection, and process signals. Commands do not hold the lifecycle queue, so pause/stop can interrupt an active command. Await `start()`/`resume()` before issuing guest operations.
-- `fs()` exposes the SDK's binary-safe reads/writes, streams, directories, metadata, copy, rename, and removal. Upload/download copy individual files using native transfer APIs, not shell quoting or base64. Acquire a fresh filesystem handle after restart; already-acquired handles follow SDK lifecycle behavior. Invalid state in `exec`, `execStream`, `upload`, or `download` rejects the returned Promise; `fs()` itself throws synchronously.
-- `pause()` suspends resident processes and RAM; `resume()` preserves them. `stop(timeoutMs = 10000)` shuts down but retains disk/identity; stopping a paused VM first resumes it. `start()` on a paused VM rejects rather than restarting it. Restart after stop creates a new boot, not a resident resume.
-- `destroy({ force?, timeoutMs? })` stops and removes only the acquired native identity, releases reference reuse, and is idempotent after success. Without an acquired identity, it releases local bookkeeping only; it does not clean up resources from failed creation. Graceful shutdown is the default with a 10000ms budget and resumes a paused VM before stopping it; timeout does not silently force-kill. Explicit `force: true` destroys without resuming paused guest execution. Invalid timeout options reject the returned Promise. Lifecycle errors propagate and cleanup of an acquired identity can be retried.
-- `start(timeoutMs = 120000)` starts its cancellation timer once the SDK returns a creation handle, then awaits creation settlement rather than abandoning the pending Promise. Cancellation is cooperative, not a hard deadline, and settlement does not guarantee storage cleanup. Calls to start/pause/resume/stop/destroy serialize per VM. Duplicate starts do not create multiple VMs, and destroy waits for an in-flight start.
-- `.name`, `.id`, `.memoryMiB`, and `.state` expose identity, normalized allocation, and **wrapper-observed** state. `unknown` means a lifecycle operation failed. State does not poll external changes or claim an authoritative remote pause query.
+`repositories` accepts case-insensitive `owner/repo` names, not URLs or wildcards, and defaults to empty. A token alone does not authorize `bind_github`. Host-bound contexts instead use their own explicit credentials. Binding is not a checkout or publication operation.
 
-If creation rejects before `awaitSandbox()` succeeds, `.id` remains unset and `.state` becomes `unknown`. The SDK may have persisted native resources, but its [creation handle](https://github.com/superradcompany/microsandbox/blob/v0.7.14/sdk/node-ts/native/sandbox_builder.rs#L905) exposes no creation ID or ownership proof on failure. The wrapper does not look up and destroy by name, which could delete a preexisting user's sandbox. Inspect native state and verify ownership before manual recovery; calling `destroy()` without an acquired identity is not evidence that native storage was removed.
+The guest working directory defaults to `/workspace`, created if absent and otherwise containing only the image and earlier work in the same task VM. **No host checkout, environment, or credentials are uploaded.** Supply tools and source through the image or explicit guest operations. The adapter provides only its declared tools, requires `complete_stage` for successful agent completion, and cleans up its provider session/client before returning. The CLI owns task VM destruction. See the [tool implementation](packages/adapters/src/copilot-tools.ts) before designing integrations that need more capabilities.
 
-Networking uses the SDK's typed [network callback](https://docs.microsandbox.dev/sdk/typescript/networking), evaluated at first start. `MicroVMNetwork` accepts and returns `InstanceType<typeof NetworkBuilder>`, preserving method completion and argument checking. The example maps host `127.0.0.1:18080` to guest TCP port `8080`; a guest service must listen there. This is host-local forwarding, not automatic public internet ingress. The same callback exposes UDP, DNS, TLS, and the official egress policy builder/object, including deny-by-default policies. Callback closures remain caller-owned; do not mutate captured configuration while starting VMs. Fixed host ports cannot be reused by concurrently running VMs, so allocate separate ports for concurrent runs.
+### Local MicroVMs
 
-## Container References
+`Container.MicroVM` uses the embedded [microsandbox 0.7.14 SDK](https://github.com/superradcompany/microsandbox/tree/v0.7.14/sdk/node-ts). The core API supports Node.js 22+ on Apple Silicon macOS, Linux with KVM, and Windows 11 with WHP (preview); the Buckles CLI/Copilot setup has the stricter requirements above. Keep optional native packages enabled and consult the [SDK runtime requirements](https://github.com/superradcompany/microsandbox/tree/v0.7.14/sdk/node-ts#runtime-notes). A cloud default backend is rejected rather than silently changing global SDK settings.
 
-`Reference.create(name)` and `new Reference(name)` have the same interned `.identity` via `Symbol.for(name)`. `.name` is a logical identifier, never an image. `Reference.join()` retains slash-joined names; internal container caches use separate task and container identity keys to avoid delimiter collisions.
+Construction and workflow resolution do not load the native addon or boot a VM. The executor starts it when needed. The CLI uses an execution-unique task `Reference` across stages and returns, then destroys every distinct resolved VM on success, failure, or cooperative cancellation. An unbound stage uses the workflow's default VM for that task. To share a named VM across chosen stages, set each stage's `container` to `Container.createOrReuse(Reference.create("workspace"))`; it inherits the workflow resource template unless explicit options are supplied. A different container reference resolves a separate VM. Different tasks never share one.
 
-```ts
-import { Container, Reference } from "@buckles/factory";
-import { mainWorkflow } from "./example/workflows";
-import { todoStage, implementationStage, reviewStage } from "./example/stages";
+For custom execution consumers, reference names must be globally unique per task execution: equal names intern to equal identities. Do not pass one workflow-run reference for several tasks. The first resolution supplies a task/container pair's configuration; later lookups reuse it. Explicitly start each VM and destroy each distinct instance in a `finally` block. Successful destruction releases reuse; configuration alone does not perform cleanup.
 
-const taskA = Reference.create("task-42/execution-1");
-const taskB = Reference.create("task-43/execution-1");
-const main = mainWorkflow.resolveContainer(todoStage, taskA);
-const implementation = mainWorkflow.resolveContainer(implementationStage, taskA);
-const review = mainWorkflow.resolveContainer(reviewStage, taskA);
-const otherMain = mainWorkflow.resolveContainer(todoStage, taskB);
-const otherImplementation = mainWorkflow.resolveContainer(implementationStage, taskB);
-// main === implementation; otherMain === otherImplementation; main !== otherMain; main !== review.
+The [MicroVM API](packages/factory/src/container.ts) provides `start`, `exec`, `execStream`, `fs`, `upload`, `download`, `pause`, `resume`, `stop`, and `destroy`. Important boundaries:
 
-const lookup = Container.createOrReuse(Reference.create("tools"), {
-  image: "alpine:3.22", cpu: 1, memory: "512MiB",
-});
-const tools = lookup(taskA);
-// Alternatively: Container.createOrReuse(reference)(taskReference, resourceOptions).
-```
+- CPU allocations must be positive safe integers. `MB`/`GB` are decimal; `MiB`/`GiB` are binary and rounded up to whole MiB. Native resource limits still apply. Explicit VM names never replace or attach to another sandbox.
+- Await `start()` or `resume()` before guest operations. `exec` returns `.code`, `.success`, `.stdout()`/`.stderr()`, and binary output accessors; a nonzero command exit is a result to handle, not success. Transport/timeouts reject. The default command timeout is 30000 ms. `execStream` supplies output events and process signals; pause/stop can interrupt running commands.
+- `fs()` exposes binary-safe SDK filesystem operations; uploads/downloads copy individual files. Acquire a fresh filesystem handle after restart. Invalid-state async operations reject; `fs()` itself throws synchronously.
+- `pause`/`resume` preserve resident processes and RAM. `stop` retains disk/identity; a subsequent `start` boots again rather than resuming. Stop/destroy resume paused guests for graceful shutdown; explicit `destroy({ force: true })` does not. Starting a paused VM rejects.
+- Lifecycle calls serialize. Startup's default 120000 ms budget begins after the SDK returns a creation handle; cancellation waits for settlement and is not a hard deadline or proof of storage cleanup. Stop/destroy default to 10000 ms and do not silently force-kill on timeout. Cleanup errors propagate and acquired identities can be retried.
+- `.state` is wrapper-observed, not a remote query. If creation fails before an identity is acquired, `.id` remains unset and `.state` is `unknown`; native resources may still exist. `destroy()` without an acquired identity releases only local bookkeeping. Verify native ownership before manual recovery; never delete another sandbox by guessing its name.
 
-Bindings sharing a task reference and a named container reference share one VM across stages, including bindings created by separate `Container.createOrReuse` calls. Different task identities never share a VM, even within the same workflow or workflow run. A different container reference within one task resolves a separate VM, as with Review above.
+The typed `network` callback runs at first start and exposes the SDK's [port forwarding and network policies](https://docs.microsandbox.dev/sdk/typescript/networking). Host-local forwarding is not public ingress: the guest service must listen on the mapped port. Fixed host ports conflict across concurrent VMs; allocate separate ports. Do not mutate captured network configuration during startup.
 
-The consumer must provide a stable task reference across that task's stages. Its name must be globally unique across concurrent and repeated task executions, even when display labels match: equal names produce equal identities. Never pass a workflow-run reference when it contains multiple tasks. The callable type shape is unchanged, but the reference argument now means a task execution, not a workflow run.
+### GitHub contexts, gates, and actions
 
-A stage binding inherits the workflow's container resource template unless it supplies explicit options. Unbound stages share a workflow-local default VM per task, never the template instance itself. Explicit template names become prefixes with unique suffixes. The first resolution supplies that task/container pair's configuration; later lookups reuse it. Missing resources fail clearly. Custom execution consumers must explicitly start each VM and destroy each unique resolved VM in a `finally` block when the task finishes; the CLI handles task cleanup for its executors. Successful destruction evicts only that task/container pair so another lookup can create a fresh instance without affecting other tasks. Factory definitions do not run background cleanup or scheduling themselves.
+`Github.SessionContext` holds a PR binding and prepared evidence. Trusted host code can bind it with `context.bind({ owner, repo, pullNumber, token })`, or the constructor can receive those settings. Construction/binding makes no requests and does not discover credentials from the environment or `gh`. Binding is single-use and shared with write references; use a new context to change the binding. Tokens remain private and absent from snapshots/errors.
 
-## Prompt Files and Contexts
+Configure the following explicitly, as in [example/stages.ts](example/stages.ts):
 
-`Skill.fromFile()` and `Instruction.fromFile()` store a `.path`; they do not read files. Explicit `.load(absoluteBaseDirectory)` reads UTF-8 content and propagates filesystem errors:
+| API | Behavior |
+| --- | --- |
+| `Github.act.ReadyForAgents(context)` | Load PR details, issue comments, inline comments, and reviews into a stable-head snapshot. Does not change draft state or request reviews. |
+| `Github.gates.Checks(context, { ignore: [], expected: ["ci"] })` | Wait for latest check runs and newest commit statuses on the current head. Replace `ci` with your required check names. |
+| `Github.gates.CopilotCodeReview(context, { status: "done" })` | Wait for the latest API-classified Copilot review submitted on the current head. Completed is not the same as approved. |
+| `Github.act.TryApprove(context)` | Submit and verify an actual APPROVE review pinned to the current SHA. Permission/self-approval failures are errors. |
+| `Github.act.Merge(context)` | Request a direct merge at an exact SHA and require a confirmed merged result and merge SHA. |
 
-```ts
-await Skill.fromFile("todo").load(absoluteExampleDirectory);
-// <base>/skills/todo/SKILL.md
-await Instruction.fromFile("checks").load(absoluteExampleDirectory);
-// <base>/instructions/checks.md
-await Instruction.fromFile("workflow.md").load(absoluteExampleDirectory);
-// <base>/instructions/workflow.md
-```
+Checks match names case-insensitively. Success, neutral, and skipped check conclusions pass; other completed outcomes fail. Pending, empty, ignored-only, or missing expected results wait until timeout. Without `expected`, the gate cannot know which checks have not appeared yet; all observed non-ignored checks still count. Copilot review completion includes COMMENTED, APPROVED, and CHANGES_REQUESTED, not pending/dismissed/old-head reviews; it requires the API's `is_copilot_code_review` classification, not a guessed bot identity.
 
-Paths containing separators resolve against the supplied base; absolute paths are used directly. No implicit working directory, cache, prompt parser, or sandbox is provided. Only load trusted file references.
+Head changes invalidate evidence, not previously requested requirements. Repeat required snapshot/check/review preparation on the new head before mutations. Snapshot, approval, and merge-result accessors return defensive copies. Actions serialize in invocation order per session, including through write references. A rejection blocks already-queued followers; await the whole batch before retrying. Gates are read-only and must not run concurrently with mutations. Confirm uncertain external outcomes before an explicit retry: a failed request is not proof that a mutation did not happen.
 
-`SessionContext` holds an in-memory `.data` map and a stable `.id`. `expectWrite()` returns a separate reference with `.writeExpected === true`, sharing data and identity without changing earlier references. It is metadata, not access control. Custom subclasses must implement the documented `createReference()` factory using real constructed instances and share their own session state; shallow cloning objects with private fields is not supported. The built-in GitHub context already handles its shared state.
+Merge does not automatically run gates or request approval. It checks any preparation previously required on that context and relies on GitHub's repository rules and the token's permissions. It requests no bypass or admin override and does not enable auto-merge, enter a merge queue, or handle stacked-PR orchestration. Merely writing those intentions in a prompt does not enforce them.
 
-## Explicit GitHub Binding
+A token whose actor has bypass permissions may still merge without satisfying branch protections or rulesets. Use a token without bypass privileges when those rules must be enforced.
 
-Creating or binding a context makes no requests and never reads environment variables, credential files, or GitHub CLI state. Supply credentials from your application's own secure configuration; do not check them into source.
+The REST adapter targets API version `2026-03-10`. Credentials need access to PRs, discussions, checks, and statuses; approval/merge need appropriate write permissions. `apiBaseUrl` defaults to `https://api.github.com`; enterprise REST roots must use HTTPS. Requests reject redirects, and paginated URLs stay on the configured API root. Permission/rate-limit errors propagate without hidden retries; `Github.ApiError.status` is available without response bodies or credentials. Defaults are `requestTimeoutMs: 30000`, `gateTimeoutMs: 300000`, `pollIntervalMs: 2000`, and `mergeMethod: "merge"`. Snapshot loading also uses the gate deadline; custom transports must honor `AbortSignal`.
 
-```ts
-import { Github } from "@buckles/adapters";
+The [check-runs endpoint](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference) covers at most GitHub's 1,000 most recent check suites; the adapter does not enumerate older suites. See also GitHub's [review](https://docs.github.com/en/rest/pulls/reviews), [status](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference), and [direct merge](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request) APIs.
 
-const context = new Github.SessionContext();
-context.bind({ owner, repo, pullNumber, token });
-await Github.act.ReadyForAgents(context);
-const snapshot = context.snapshot;
-```
+## Contributing
 
-The constructor also accepts the same settings. `apiBaseUrl` defaults to `https://api.github.com`; an enterprise REST root such as `https://github.example/api/v3` must use HTTPS. Binding is single-use and shared with existing write references. The token stays private, is absent from snapshots/errors, and is never logged or persisted by the adapter. A trusted `fetch` override supports unit tests.
-
-`ReadyForAgents` loads PR details, all issue comments, inline review comments, and reviews. It publishes a complete snapshot only if the PR head is stable across the read. `.snapshot`, `.approval`, and `.mergeResult` return defensive copies. ReadyForAgents does not change draft state or request reviews.
-
-The REST HTTP helper uses native fetch rather than a GitHub REST SDK: PR actions need only JSON GET/POST/PUT, explicit bearer authentication, and numbered REST pagination. The separate Copilot executor uses the official Copilot SDK. The REST helper does not need OAuth flows, SDK plugins, or mutation retries. Requests reject redirects. Pagination uses the next-link indicator but constructs subsequent page URLs from the configured API root, so a response cannot redirect the token to another host. HTTP errors expose `Github.ApiError.status`, not the response body or request credentials. Rate-limit and permission failures propagate without hidden retries.
-
-## Gates and Actions
-
-- `Github.gates.Checks(context, { ignore, expected? })` combines latest check runs with newest commit statuses per context, reading every page. Ignore/expected names are case-insensitive. Success, neutral, and skipped check conclusions pass; other completed outcomes fail with the failing check/status names, without response bodies or credentials. Pending, empty, ignored-only, and missing expected results wait until timeout. Without `expected`, the gate cannot know which checks have not appeared yet; specify expected names when that matters. All observed non-ignored checks still count.
-- `Github.gates.CopilotCodeReview(context, { status: "done" })` requires the latest API-classified Copilot review to be submitted on the current head. COMMENTED, APPROVED, and CHANGES_REQUESTED mean completed, not approved. Pending, dismissed, requested-only, and old-head reviews cannot pass. APIs lacking `is_copilot_code_review` cannot satisfy this gate; there is no guessed bot-identity fallback.
-- Both gates check the head before and after each observation. A head change during an observation rejects. A later gate or `ReadyForAgents` call can begin preparation for a new head on the same context, clearing stale evidence without forgetting any requested snapshot, checks, review, or approval requirements. Repeating preparation invalidates that operation's prior result until it succeeds again.
-- `Github.act.TryApprove(context)` actually submits APPROVE at the current SHA and validates the returned review state, SHA, and submission. It requires current snapshot/gate evidence for all previously requested preparation, but can replace an old approval. A failed approval still leaves approval required for Merge. It does not suppress errors (including self-approval or permission failures).
-- `Github.act.Merge(context)` sends an exact expected SHA and checks `merged: true` plus the returned merge SHA. It rejects stale or missing required preparation. If Checks passed on head A, loading a snapshot or passing another gate on head B does not remove the need for Checks to pass on B. It does not request admin bypass, auto-merge, or a merge queue. Standalone Merge checks the head when its queued action executes, but does not automatically run gates or request approval; callers must explicitly run required gates/actions, and GitHub enforces repository rules according to the token's permissions.
-
-All `act` calls serialize in invocation order per session, including calls through write references. A rejection blocks the remaining actions already queued in that batch. Once those promises settle, a later explicit attempt can use the same context. Await every promise in a failed batch (for example with `Promise.allSettled`) before retrying. After a failure or head change, rerun required preparation; confirm any uncertain mutation outcome with GitHub before explicitly retrying it. There is no automatic retry, and a failed request is not proof that a mutation did not happen. Separate contexts are independent, even when bound to the same PR; a new context is needed only to change the binding.
-
-```ts
-await Promise.all([
-  Github.act.TryApprove(context),
-  Github.act.Merge(context),
-]);
-```
-
-This array approves first, then merges only if approval succeeds. Consumers must await all hook/gate promises and must not proceed after a gate rejection. Gates are read-only and do not participate in the action queue. Do not execute gates concurrently with mutation actions.
-
-Defaults: `requestTimeoutMs: 30000`, `gateTimeoutMs: 300000`, `pollIntervalMs: 2000`, `mergeMethod: "merge"`. Snapshot loading also uses the gate deadline. Custom transports must honor AbortSignal. This REST context API makes no requests until a gate or action is explicitly called; CopilotExecutor separately contacts its provider during `execute()`.
-
-## API Scope and Sources
-
-The adapter targets GitHub REST API version `2026-03-10`. It requires token access to the relevant PR, discussions, checks, and statuses; approval and merge additionally require appropriate write permissions. Tests make no live requests and do not certify organization-specific permissions or rules.
-
-- [Reviews and Copilot classification](https://docs.github.com/en/rest/pulls/reviews)
-- [Check runs](https://docs.github.com/en/rest/checks/runs#list-check-runs-for-a-git-reference): the reference endpoint covers at most GitHub's 1,000 most recent check suites. This adapter does not enumerate historical suites beyond that API limit.
-- [Commit statuses](https://docs.github.com/en/rest/commits/statuses#list-commit-statuses-for-a-reference)
-- [Pagination](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api)
-- [Direct merge](https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request): this endpoint does not support stacked PRs or merge queues. Those workflows need a different integration; they are not reported as successfully merged here.
-- [pnpm workspaces](https://pnpm.io/workspaces), [TypeScript declarations](https://www.typescriptlang.org/tsconfig/#declaration), and [tsx preload](https://tsx.hirok.io/dev-api/node-cli)
+For development setup, package architecture, and build/test instructions, see [CONTRIBUTING.md](CONTRIBUTING.md). The workspace contains [`@buckles/factory`](packages/factory), [`@buckles/adapters`](packages/adapters), [`@buckles/cli`](packages/cli), and [`@buckles/utils`](packages/utils); their sources and exported declarations provide the detailed API reference.
