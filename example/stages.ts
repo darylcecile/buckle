@@ -6,12 +6,30 @@ import { Github } from '@buckles/adapters';
 const mainContainerReference = new Reference("mainContainer");
 const reviewContainerReference = new Reference("reviewContainer");
 
+function delivery(): "merge" | "pull-request" {
+	const value = userDecisions.data.get("delivery");
+	if (value !== "merge" && value !== "pull-request") {
+		throw new Error('Todo must record userDecisions key "delivery" as "merge" or "pull-request" before proceeding');
+	}
+	return value;
+}
+
+function currentHeadGates(): Promise<void>[] {
+	return [
+		Github.gates.CopilotCodeReview(githubContext, { status: "done" }),
+		Github.gates.Checks(githubContext, { ignore: [], expected: ["buckles/verification"] }),
+	];
+}
+
 export const todoStage = new Stage({
 	name: "Todo",
 	kind: "todo",
 	agents: [ todoAgent ],
 	contexts: [ plan, userDecisions ],
-	instruction: "Clarify the outcome, constraints and acceptance criteria.",
+	instruction: 'Clarify the outcome, constraints and acceptance criteria. Record userDecisions key "delivery": "merge" by default, or "pull-request" when the user explicitly requests PR-only delivery. Clarify genuinely ambiguous intent.',
+	hooks: {
+		afterAgents: () => [(async () => { delivery(); })()],
+	},
 	container: Container.createOrReuse(mainContainerReference),
 });
 
@@ -32,7 +50,8 @@ export const implementationStage = new Stage({
 	agents: [ implementationAgent ],
 	contexts: [ plan, userDecisions, dependencies, learnings, githubContext, reviewFindings ],
 	policies: {
-		returns: () => [ todoStage, triageStage ]
+		returns: () => [ todoStage, triageStage ],
+		permissions: { createNewTasks: false, publishPullRequest: true },
 	},
 	instruction: "Implement the chosen task according to the determined priority and next steps.",
 	container: Container.createOrReuse(mainContainerReference),
@@ -43,15 +62,12 @@ export const checksStage = new Stage({
 	kind: "checks",
 	agents: [ checksAgent ],
 	contexts: [ checksFindings.expectWrite(), githubContext ],
+	hooks: {
+		beforeAgents: () => [Github.act.ReadyForChecks(githubContext, { ignore: [], expected: ["buckles/verification"] })],
+	},
 	policies: {
 		returns: () => [ implementationStage ],
-		gates: () => [ 
-			// github gates are async and will resolve/reject when the respective conditions are met
-			Github.gates.CopilotCodeReview(githubContext, { status: "done" }),
-			Github.gates.Checks(githubContext, {
-				ignore: [ "some-ci-check" ]
-			})
-		],
+		gates: currentHeadGates,
 	},
 	instruction: Instruction.fromFile('checks'),
 	container: Container.createOrReuse(mainContainerReference),
@@ -80,12 +96,16 @@ export const mergeStage = new Stage({
 	agents: [ ],
 	contexts: [ plan, userDecisions, dependencies, learnings, githubContext, reviewFindings, checksFindings ],
 	hooks: {
-		// even though each action is async and runs in parallel, github's act will batch and execute them in order
-		afterAgents: () => [
-			Github.act.TryApprove(githubContext),
-			Github.act.Merge(githubContext)
-		]
+		beforeAgents: () => [(async () => {
+			if (delivery() === "pull-request") {
+				const url = githubContext.snapshot?.pullRequest.url;
+				if (!url) throw new Error("PR-only delivery requested, but the reviewed pull request URL is unavailable; merge stopped");
+				throw new Error(`PR-only delivery requested: ${url} is ready for the user's review. Stopped before Merge; no merge was attempted and Done was not run.`);
+			}
+		})()],
+		afterAgents: () => [Github.act.Merge(githubContext)],
 	},
+	policies: { gates: currentHeadGates },
 	instruction: Instruction.fromFile('merge'),
 	container: Container.createOrReuse(mainContainerReference),
 });
@@ -95,6 +115,12 @@ export const doneStage = new Stage({
 	kind: "done",
 	agents: [ doneAgent ],
 	contexts: [ plan, userDecisions, learnings, githubContext ],
+	hooks: {
+		beforeAgents: () => [(async () => {
+			if (!githubContext.mergeResult?.merged) throw new Error("Done requires an actual confirmed GitHub merge result");
+			await Github.act.ReadyForAgents(githubContext);
+		})()],
+	},
 	policies: {
 		permissions: { createNewTasks: true }
 	},

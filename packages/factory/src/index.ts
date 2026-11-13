@@ -210,6 +210,8 @@ export interface StagePolicies {
 	permissions?: {
 		/** Whether this stage may create tasks. This package does not create tasks. */
 		createNewTasks: boolean;
+		/** Whether Copilot may publish repository changes as a pull request. Defaults to false. */
+		publishPullRequest?: boolean;
 	};
 }
 
@@ -288,6 +290,18 @@ export interface Task {
 	readonly workflow: string;
 }
 
+/** The most recent agent output and the stage visit that produced it. */
+export interface ExecutorHandoff {
+	/** Display name of the producing stage. */
+	stage: string;
+	/** Display name of the producing agent. */
+	agent: string;
+	/** Visit number of the producing stage, starting at one. */
+	attempt: number;
+	/** Output produced by that agent invocation. */
+	output: string;
+}
+
 /**
  * One agent invocation prepared by a runtime such as a CLI worker. The runtime
  * resolves instructions and task-scoped resources, and enforces the policies
@@ -308,6 +322,8 @@ export interface ExecutorRequest {
 	instructions: string;
 	/** Context references isolated per task by the runtime, preserving sharing within that task. */
 	contexts: readonly SessionContext[];
+	/** Latest defined agent output in this task, carried across agents, stages, and declared returns. */
+	handoff?: Readonly<ExecutorHandoff>;
 	/** Runtime cancellation signal that the executor must observe. */
 	signal: AbortSignal;
 	/** Reports progress through the runtime's reporting policy. */

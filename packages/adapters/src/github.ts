@@ -1,6 +1,6 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { Model, SessionContext as FactorySessionContext, type ModelOptions } from "@buckles/factory";
-import { boolean, bounded, Client, identifier, nullableText, record, text, type SessionOptions } from "./client.js";
+import { ApiError, boolean, bounded, Client, identifier, nullableText, record, text, type SessionOptions } from "./client.js";
 
 export { ApiError, type SessionOptions } from "./client.js";
 export { CopilotExecutor, type CopilotExecutorOptions } from "./copilot.js";
@@ -66,7 +66,7 @@ export interface Review {
 	readonly isCopilot: boolean;
 }
 
-/** Complete, paginated PR discussion snapshot from a successful ReadyForAgents action. */
+/** Complete, paginated PR discussion snapshot from a successful preparation action. */
 export interface Snapshot {
 	/** Pull request details whose head remained stable across the snapshot read. */
 	readonly pullRequest: PullRequest;
@@ -88,13 +88,45 @@ export interface MergeResult {
 	readonly merged: true;
 }
 
+/** Credential-free identity of the explicitly bound pull request. */
+export interface Binding {
+	/** Repository owner or organization. */
+	readonly owner: string;
+	/** Repository name, without its owner. */
+	readonly repo: string;
+	/** Bound pull request number. */
+	readonly pullNumber: number;
+}
+
+/** An observed check run or the newest legacy status for a context. */
+export interface Check {
+	/** Case-normalized check run name or legacy status context. */
+	readonly name: string;
+	/** Normalized observed outcome; pending is never a pass. */
+	readonly state: "passed" | "pending" | "failed";
+	/** GitHub check URL or the status's target URL, when supplied. */
+	readonly url?: string;
+}
+
+/** Observations for agents, not proof that the authoritative Checks gate passed. */
+export interface CheckSnapshot {
+	/** Exact PR head that remained stable across this observation. */
+	readonly headSha: string;
+	/** All observed non-ignored checks/statuses; expected-but-missing names are not invented. */
+	readonly checks: readonly Check[];
+	/** ISO timestamp at which loading completed. */
+	readonly loadedAt: string;
+}
+
 interface SessionState {
 	client?: Client;
+	binding?: Binding;
 	snapshotRequired?: boolean;
 	approvalRequired?: boolean;
 	checksRequired?: boolean;
 	reviewRequired?: boolean;
 	snapshot?: Snapshot;
+	checks?: CheckSnapshot;
 	approval?: Review;
 	merge?: MergeResult;
 	checksHead?: string;
@@ -139,11 +171,18 @@ export class SessionContext extends FactorySessionContext {
 		const state = session(this);
 		if (state.client) throw new Error("GitHub session is already bound; create a new context to change its binding");
 		state.client = new Client(options);
+		state.binding = { owner: options.owner, repo: options.repo, pullNumber: options.pullNumber };
 		return this;
 	}
 
 	/** Whether explicit connection settings have been supplied; does not test authentication. */
 	get bound(): boolean { return session(this).client !== undefined; }
+
+	/** Defensive, credential-free copy of the explicitly supplied repository and PR identity. */
+	get binding(): Binding | undefined { return structuredClone(session(this).binding); }
+
+	/** Current-head check observations from ReadyForChecks; these do not imply a gate pass. */
+	get checks(): CheckSnapshot | undefined { return structuredClone(session(this).checks); }
 
 	/** Defensive copy of the prepared snapshot; undefined until loaded or after invalidation. */
 	get snapshot(): Snapshot | undefined { return structuredClone(session(this).snapshot); }
@@ -199,12 +238,27 @@ function requireOpen(pull: PullRequest): void {
 
 function prepareHead(state: SessionState, head: string): void {
 	if (state.snapshot?.pullRequest.headSha !== head) state.snapshot = undefined;
+	if (state.checks?.headSha !== head) state.checks = undefined;
 	if (state.approval?.commitId !== head) state.approval = undefined;
 	if (state.checksHead !== head) state.checksHead = undefined;
 	if (state.reviewHead !== head) state.reviewHead = undefined;
 }
 
+async function discussion(client: Client, pull: PullRequest, signal: AbortSignal): Promise<Snapshot> {
+	const comments = (await client.list(`${client.repoPath}/issues/${pull.number}/comments`, undefined, signal)).map(comment);
+	const reviewComments = (await client.list(`${client.pullPath}/comments`, undefined, signal)).map(comment);
+	const reviews = (await client.list(`${client.pullPath}/reviews`, undefined, signal)).map(review);
+	return { pullRequest: pull, comments, reviewComments, reviews, loadedAt: new Date().toISOString() };
+}
+
+function copilotReviewDone(reviews: readonly Review[], headSha: string): boolean {
+	const latest = reviews.filter((entry) => entry.isCopilot).at(-1);
+	return latest !== undefined && latest.commitId === headSha && Boolean(latest.submittedAt)
+		&& ["COMMENTED", "APPROVED", "CHANGES_REQUESTED"].includes(latest.state);
+}
+
 function requirePreparedHead(state: SessionState, head: string, includeApproval = true): void {
+	prepareHead(state, head);
 	const preparations = [
 		[state.snapshotRequired, state.snapshot?.pullRequest.headSha, "ReadyForAgents"],
 		[state.checksRequired, state.checksHead, "Checks"],
@@ -252,13 +306,74 @@ export const act = {
 			await bounded(client.gateTimeout, "GitHub snapshot loading timed out", async (signal) => {
 				const pull = pullRequest(await client.get(client.pullPath, signal));
 				prepareHead(state, pull.headSha);
-				const comments = (await client.list(`${client.repoPath}/issues/${pull.number}/comments`, undefined, signal)).map(comment);
-				const reviewComments = (await client.list(`${client.pullPath}/comments`, undefined, signal)).map(comment);
-				const reviews = (await client.list(`${client.pullPath}/reviews`, undefined, signal)).map(review);
+				const snapshot = await discussion(client, pull, signal);
 				const latest = pullRequest(await client.get(client.pullPath, signal));
+				prepareHead(state, latest.headSha);
 				if (latest.headSha !== pull.headSha) throw new Error("GitHub pull request head changed while loading context; rerun required preparation");
 				signal.throwIfAborted();
-				state.snapshot = { pullRequest: latest, comments, reviewComments, reviews, loadedAt: new Date().toISOString() };
+				state.snapshot = { ...snapshot, pullRequest: latest, loadedAt: new Date().toISOString() };
+			});
+		});
+	},
+	/**
+	 * Prepares stable-head checks and discussion before a Checks agent runs. Failed
+	 * checks return evidence immediately for repair; pending/missing checks and the
+	 * Copilot review wait within the gate deadline. This never passes a gate: rerun
+	 * Checks and (by default) CopilotCodeReview after the agent has assessed findings.
+	 */
+	ReadyForChecks(context: SessionContext, options: ReadyForChecksOptions): Promise<void> {
+		return queue(context, async (state) => {
+			const { ignore, expected } = checkNames(options);
+			state.snapshotRequired = true;
+			state.checksRequired = true;
+			state.snapshot = undefined;
+			state.checks = undefined;
+			state.checksHead = undefined;
+			if (options.copilotReview !== false) {
+				state.reviewRequired = true;
+				state.reviewHead = undefined;
+			}
+			let snapshot: Snapshot;
+			let checks: Check[];
+			await poll(context, "checks preparation", async (client, pull, signal) => {
+				checks = await observeChecks(client, pull.headSha, ignore, signal);
+				snapshot = await discussion(client, pull, signal);
+				return checks.some((check) => check.state === "failed")
+					|| (checksSettled(checks, expected) && (options.copilotReview === false || copilotReviewDone(snapshot.reviews, pull.headSha)));
+			}, (state, pull) => {
+				const loadedAt = new Date().toISOString();
+				state.snapshot = { ...snapshot, pullRequest: pull, loadedAt };
+				state.checks = { headSha: pull.headSha, checks, loadedAt };
+			});
+		});
+	},
+	/**
+	 * Requests an initial Copilot review, or a new review after the previous one completes.
+	 * Requires Pull requests: write and Copilot code review access. Request acceptance
+	 * is not review completion; the current-head CopilotCodeReview gate remains required.
+	 */
+	RequestCopilotReview(context: SessionContext): Promise<void> {
+		return queue(context, async (state, client) => {
+			state.reviewRequired = true;
+			state.reviewHead = undefined;
+			await bounded(client.gateTimeout, "GitHub Copilot review request timed out; confirm its outcome before retrying", async (signal) => {
+				const pull = pullRequest(await client.get(client.pullPath, signal));
+				requireOpen(pull);
+				prepareHead(state, pull.headSha);
+				if (pull.draft) throw new Error("Cannot request Copilot review of a draft pull request; publish it ready for review first");
+				try {
+					const result = record((await client.request(`${client.pullPath}/copilot-code-review`, "POST", undefined, signal)).data);
+					if (result.state !== "PENDING" || typeof result.node_id !== "string" || !result.node_id.trim()) {
+						throw new Error("GitHub did not confirm a pending Copilot code-review request");
+					}
+				} catch (error) {
+					if (!(error instanceof ApiError)) throw error;
+					error.message += ` while requesting Copilot code review for ${client.pullPath}`;
+					throw error;
+				}
+				const latest = pullRequest(await client.get(client.pullPath, signal));
+				prepareHead(state, latest.headSha);
+				if (latest.headSha !== pull.headSha) throw new Error("GitHub pull request head changed while requesting Copilot review; confirm the request and prepare the current head");
 			});
 		});
 	},
@@ -319,6 +434,12 @@ export interface ChecksOptions {
 	expected?: string[];
 }
 
+/** Read-only preparation for a Checks agent, independently of after-agent gates. */
+export interface ReadyForChecksOptions extends ChecksOptions {
+	/** Wait for the latest classified Copilot review on this head. Default: true. */
+	copilotReview?: boolean;
+}
+
 function names(values: readonly string[]): Set<string> {
 	return new Set(values.map((value) => {
 		if (typeof value !== "string" || !value.trim()) throw new TypeError("Check names must be nonempty strings");
@@ -326,9 +447,11 @@ function names(values: readonly string[]): Set<string> {
 	}));
 }
 
-interface Check {
-	name: string;
-	state: "passed" | "pending" | "failed";
+function checkNames(options: ChecksOptions): { ignore: Set<string>; expected: Set<string> } {
+	const ignore = names(options.ignore);
+	const expected = names(options.expected ?? []);
+	if ([...expected].some((name) => ignore.has(name))) throw new TypeError("Expected checks cannot also be ignored");
+	return { ignore, expected };
 }
 
 function checkRuns(values: unknown[], headSha: string): Check[] {
@@ -337,7 +460,7 @@ function checkRuns(values: unknown[], headSha: string): Check[] {
 		if (text(raw.head_sha) !== headSha) throw new Error("GitHub returned checks for a different head");
 		const state = text(raw.status) !== "completed" ? "pending"
 			: ["success", "neutral", "skipped"].includes(text(raw.conclusion)) ? "passed" : "failed";
-		return { name: text(raw.name).toLowerCase(), state };
+		return { name: text(raw.name).toLowerCase(), state, ...(raw.html_url ? { url: text(raw.html_url) } : {}) };
 	});
 }
 
@@ -349,27 +472,36 @@ function commitStatuses(values: unknown[]): Check[] {
 		if (latest.has(name)) continue;
 		const state = text(raw.state);
 		if (!["success", "pending", "failure", "error"].includes(state)) throw new Error("Unknown GitHub commit status state");
-		latest.set(name, { name, state: state === "success" ? "passed" : state === "pending" ? "pending" : "failed" });
+		latest.set(name, { name, state: state === "success" ? "passed" : state === "pending" ? "pending" : "failed",
+			...(raw.target_url ? { url: text(raw.target_url) } : {}) });
 	}
 	return [...latest.values()];
 }
 
-async function checksPass(client: Client, headSha: string, ignore: Set<string>, expected: Set<string>, signal: AbortSignal): Promise<boolean> {
+async function observeChecks(client: Client, headSha: string, ignore: Set<string>, signal: AbortSignal): Promise<Check[]> {
 	const path = `${client.repoPath}/commits/${encodeURIComponent(headSha)}`;
 	const runs = checkRuns(await client.list(`${path}/check-runs?filter=latest`, "check_runs", signal), headSha);
 	const statuses = commitStatuses(await client.list(`${path}/statuses`, undefined, signal));
-	const checks = [...runs, ...statuses].filter((check) => !ignore.has(check.name));
-	const failed = checks.filter((check) => check.state === "failed").map((check) => check.name);
-	if (failed.length > 0) throw new Error(`GitHub checks failed for the current head: ${failed.join(", ")}`);
+	return [...runs, ...statuses].filter((check) => !ignore.has(check.name));
+}
+
+function checksSettled(checks: readonly Check[], expected: Set<string>): boolean {
 	const present = new Set(checks.map((check) => check.name));
 	return checks.length > 0 && [...expected].every((name) => present.has(name)) && checks.every((check) => check.state === "passed");
+}
+
+async function checksPass(client: Client, headSha: string, ignore: Set<string>, expected: Set<string>, signal: AbortSignal): Promise<boolean> {
+	const checks = await observeChecks(client, headSha, ignore, signal);
+	const failed = checks.filter((check) => check.state === "failed").map((check) => check.name);
+	if (failed.length > 0) throw new Error(`GitHub checks failed for the current head: ${failed.join(", ")}`);
+	return checksSettled(checks, expected);
 }
 
 async function poll(
 	context: SessionContext,
 	label: string,
-	observe: (client: Client, headSha: string, signal: AbortSignal) => Promise<boolean>,
-	accept: (state: SessionState, headSha: string) => void,
+	observe: (client: Client, pull: PullRequest, signal: AbortSignal) => Promise<boolean>,
+	accept: (state: SessionState, pull: PullRequest) => void,
 ): Promise<void> {
 	const { client, state } = bound(context);
 	await bounded(client.gateTimeout, `GitHub ${label} gate timed out`, async (signal) => {
@@ -377,18 +509,19 @@ async function poll(
 		while (true) {
 			const pull = pullRequest(await client.get(client.pullPath, signal));
 			requireOpen(pull);
+			prepareHead(state, pull.headSha);
 			if (expectedHead === undefined) {
 				expectedHead = pull.headSha;
-				prepareHead(state, expectedHead);
 			}
 			if (pull.headSha !== expectedHead) throw new Error("GitHub pull request head changed during gate polling");
-			const ready = await observe(client, pull.headSha, signal);
+			const ready = await observe(client, pull, signal);
 			const latest = pullRequest(await client.get(client.pullPath, signal));
 			requireOpen(latest);
+			prepareHead(state, latest.headSha);
 			if (latest.headSha !== expectedHead) throw new Error("GitHub pull request head changed during gate polling");
 			if (ready) {
 				signal.throwIfAborted();
-				accept(state, expectedHead);
+				accept(state, latest);
 				return;
 			}
 			await delay(client.pollInterval, undefined, { signal });
@@ -413,12 +546,10 @@ export const gates = {
 		const state = session(context);
 		state.reviewRequired = true;
 		state.reviewHead = undefined;
-		await poll(context, "Copilot review", async (client, headSha, signal) => {
+		await poll(context, "Copilot review", async (client, pull, signal) => {
 			const reviews = (await client.list(`${client.pullPath}/reviews`, undefined, signal)).map(review);
-			const latest = reviews.filter((entry) => entry.isCopilot).at(-1);
-			return latest !== undefined && latest.commitId === headSha && Boolean(latest.submittedAt)
-				&& ["COMMENTED", "APPROVED", "CHANGES_REQUESTED"].includes(latest.state);
-		}, (state, headSha) => { state.reviewHead = headSha; });
+			return copilotReviewDone(reviews, pull.headSha);
+		}, (state, pull) => { state.reviewHead = pull.headSha; });
 	},
 	/**
 	 * Waits for all non-ignored latest check runs and commit statuses on the current
@@ -428,13 +559,11 @@ export const gates = {
 	 * changed heads reject.
 	 */
 	async Checks(context: SessionContext, options: ChecksOptions): Promise<void> {
-		const ignore = names(options.ignore);
-		const expected = names(options.expected ?? []);
-		if ([...expected].some((name) => ignore.has(name))) throw new TypeError("Expected checks cannot also be ignored");
+		const { ignore, expected } = checkNames(options);
 		const state = session(context);
 		state.checksRequired = true;
 		state.checksHead = undefined;
-		await poll(context, "checks", (client, headSha, signal) => checksPass(client, headSha, ignore, expected, signal),
-			(state, headSha) => { state.checksHead = headSha; });
+		await poll(context, "checks", (client, pull, signal) => checksPass(client, pull.headSha, ignore, expected, signal),
+			(state, pull) => { state.checksHead = pull.headSha; });
 	},
 };

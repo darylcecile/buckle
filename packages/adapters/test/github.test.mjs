@@ -37,6 +37,10 @@ test("binding is explicit, inert, shared by write references, and credential-saf
 	await assert.rejects(Github.act.ReadyForAgents(context), /unbound/);
 	context.bind({ owner: "acme", repo: "project", pullNumber: 7, token: "test-only-token", fetch: () => { throw new Error("unexpected network"); } });
 	assert.equal(write.bound, true);
+	assert.deepEqual(write.binding, { owner: "acme", repo: "project", pullNumber: 7 });
+	const binding = write.binding;
+	binding.repo = "another";
+	assert.equal(context.binding.repo, "project");
 	assert.equal(write.snapshot, undefined);
 	assert.equal(inspect(context, { showHidden: true }).includes("test-only-token"), false);
 	assert.equal(JSON.stringify(context).includes("test-only-token"), false);
@@ -158,6 +162,114 @@ test("HTTP errors, transport errors, and request timeouts reject without exposin
 });
 
 const check = (name, overrides = {}) => ({ name, head_sha: head, status: "completed", conclusion: "success", ...overrides });
+
+test("ReadyForChecks exposes failed current-head evidence before the agent without waiting for Copilot or passing gates", async () => {
+	let currentHead = head;
+	const { context, calls } = setup(({ url }) => {
+		if (url.pathname.endsWith("/pulls/7")) return response(pull(currentHead));
+		if (url.pathname.endsWith("/check-runs")) return response({ check_runs: [check("Build", { conclusion: "failure", html_url: "https://github.com/acme/project/actions/runs/1" })] });
+		if (url.pathname.endsWith("/statuses")) return response([{ context: "buckles/verification", state: "failure", target_url: "https://github.com/acme/project/pull/7" }]);
+		if (url.pathname.endsWith("/reviews")) return response([review({ is_copilot_code_review: true, state: "PENDING", submitted_at: null })]);
+		return response([comment(1)]);
+	});
+	await Github.act.ReadyForChecks(context, { ignore: [], expected: ["buckles/verification"] });
+	assert.deepEqual(context.checks.checks, [
+		{ name: "build", state: "failed", url: "https://github.com/acme/project/actions/runs/1" },
+		{ name: "buckles/verification", state: "failed", url: "https://github.com/acme/project/pull/7" },
+	]);
+	assert.equal(context.checks.headSha, head);
+	assert.equal(context.snapshot.pullRequest.headSha, head);
+	assert.equal(context.snapshot.reviews[0].state, "PENDING");
+	assert.equal(calls.filter(({ url }) => url.pathname.endsWith("/check-runs")).length, 1);
+	const copy = context.checks;
+	copy.checks.length = 0;
+	assert.equal(context.expectWrite().checks.checks.length, 2);
+	await assert.rejects(Github.act.Merge(context), /Checks, CopilotCodeReview/);
+	currentHead = otherHead;
+	await Github.act.ReadyForAgents(context);
+	assert.equal(context.checks, undefined);
+	assert.equal(context.snapshot.pullRequest.headSha, otherHead);
+});
+
+test("ReadyForChecks waits for expected checks and classified review settlement, then authoritative gates still run", async () => {
+	let observations = 0;
+	const { context } = setup(({ url, method }) => {
+		if (url.pathname.endsWith("/pulls/7")) return response(pull());
+		if (url.pathname.endsWith("/check-runs")) {
+			observations++;
+			return response({ check_runs: [check("external-ci")] });
+		}
+		if (url.pathname.endsWith("/statuses")) return response(observations === 1 ? [] : [{ context: "buckles/verification", state: "success" }]);
+		if (url.pathname.endsWith("/reviews")) return response([review({ is_copilot_code_review: true, commit_id: observations < 3 ? otherHead : head })]);
+		if (method === "PUT") return response({ merged: true, sha: "merged-current-head" });
+		return response([]);
+	});
+	await Github.act.ReadyForChecks(context, { ignore: [], expected: ["buckles/verification"] });
+	assert.equal(observations, 3);
+	assert.equal(context.snapshot.reviews[0].commitId, head);
+	assert.equal(context.checks.checks.length, 2);
+	await assert.rejects(Github.act.Merge(context), /Checks, CopilotCodeReview/);
+	await Promise.all([
+		Github.gates.Checks(context, { ignore: [], expected: ["buckles/verification"] }),
+		Github.gates.CopilotCodeReview(context, { status: "done" }),
+	]);
+	await Github.act.Merge(context);
+	assert.equal(context.mergeResult.sha, "merged-current-head");
+});
+
+test("ReadyForChecks bounds missing results and rejects a changing head without exposing stale observations", async () => {
+	let reads = 0;
+	const changing = setup(({ url }) => {
+		if (url.pathname.endsWith("/pulls/7")) return response(pull(++reads < 4 ? head : otherHead));
+		if (url.pathname.endsWith("/check-runs")) return response({ check_runs: [check("build")] });
+		return response([]);
+	});
+	await Github.act.ReadyForChecks(changing.context, { ignore: [], copilotReview: false });
+	await assert.rejects(Github.act.ReadyForChecks(changing.context, { ignore: [], copilotReview: false }), /head changed/);
+	assert.equal(changing.context.checks, undefined);
+	assert.equal(changing.context.snapshot, undefined);
+	const missing = setup(({ url }) => {
+		if (url.pathname.endsWith("/pulls/7")) return response(pull());
+		return response(url.pathname.endsWith("/check-runs") ? { check_runs: [] } : []);
+	}, { gateTimeoutMs: 20 });
+	await assert.rejects(Github.act.ReadyForChecks(missing.context, { ignore: [], expected: ["buckles/verification"] }), /timed out/);
+	assert.equal(missing.context.checks, undefined);
+});
+
+test("RequestCopilotReview confirms dedicated initial and subsequent requests without treating acceptance or errors as completion", async () => {
+	let currentHead = head;
+	let reviewedHead;
+	const { context, calls } = setup(({ url, method, body }) => {
+		if (method === "POST") {
+			assert.equal(url.pathname, "/repos/acme/project/pulls/7/copilot-code-review");
+			assert.equal(body, undefined);
+			return response({ node_id: "RRR_request", state: "PENDING" }, { status: 201 });
+		}
+		if (url.pathname.endsWith("/pulls/7")) return response(pull(currentHead));
+		if (url.pathname.endsWith("/reviews")) return response(reviewedHead ? [review({ is_copilot_code_review: true, commit_id: reviewedHead })] : []);
+		throw new Error("Unexpected route");
+	});
+	await Github.act.RequestCopilotReview(context.expectWrite());
+	await assert.rejects(Github.act.Merge(context), /CopilotCodeReview/);
+	reviewedHead = head;
+	await Github.gates.CopilotCodeReview(context, { status: "done" });
+	currentHead = otherHead;
+	await Github.act.RequestCopilotReview(context);
+	await assert.rejects(Github.act.Merge(context), /CopilotCodeReview/);
+	assert.equal(calls.filter(({ method }) => method === "POST").length, 2);
+	for (const confirmation of [{ node_id: "RRR_request", state: "DONE" }, { node_id: " ", state: "PENDING" }]) {
+		const malformed = setup(({ method }) => response(method === "POST" ? confirmation : pull(), method === "POST" ? { status: 201 } : undefined));
+		await assert.rejects(Github.act.RequestCopilotReview(malformed.context), /did not confirm a pending Copilot code-review request/);
+		await assert.rejects(Github.act.Merge(malformed.context), /CopilotCodeReview/);
+	}
+	for (const status of [403, 409, 500]) {
+		const rejected = setup(({ method }) => response(method === "POST" ? {} : pull(), method === "POST" ? { status } : undefined));
+		await assert.rejects(Github.act.RequestCopilotReview(rejected.context), {
+			name: "GithubApiError", status,
+			message: `GitHub API request failed (HTTP ${status}) while requesting Copilot code review for repos/acme/project/pulls/7`,
+		});
+	}
+});
 
 test("rechecking a new head preserves required snapshot, review, and approval until each is refreshed", async () => {
 	let currentHead = head;

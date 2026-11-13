@@ -18,6 +18,12 @@ description: "Use during Todo to clarify the requested outcome, constraints and 
 5. Ask focused questions only where the answer changes scope, acceptance or authority.
 	Record confirmed answers in userDecisions and reflect them in plan; keep unanswered
 	questions visibly unresolved rather than converting guesses into decisions.
+6. Before complete_stage, use write_context to set the canonical userDecisions key
+	`delivery` to `"merge"` by default, or `"pull-request"` when the request explicitly
+	says PR-only, open/create a PR for review without merging, or do not merge. Preserve
+	that instruction across returns. Clarify genuinely ambiguous delivery intent with
+	ask_user. Do not treat repository admin permission as the user's merge instruction.
+	Todo's after-agent hook requires this value before any later stage can run.
 
 ## Handoff
 
@@ -32,4 +38,3 @@ another stage is scheduled.
 
 This is research and clarification, not permission to change product code, open PRs or
 create additional tasks.
-

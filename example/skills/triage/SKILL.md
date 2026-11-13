@@ -13,6 +13,10 @@ description: "Use during Triage to select repository work or existing PRs and pl
 2. Inspect relevant repository information or existing PRs using available, permitted
 	research tools. Identify the selected repository and work, with links and revisions
 	where known. Prefer continuing suitable existing work over proposing a duplicate.
+	The example's host repository configuration prepares the guest checkout, including
+	private source, without exposing credentials. Use the supplied repository identity and
+	guest checkout; do not attempt an unauthenticated private clone or ask for a token.
+	Record the exact source revision and target branch in plan for Implementation.
 3. Choose the smallest complete set of changes that satisfies the acceptance criteria.
 	Name the affected areas and responsibilities, distinguishing confirmed owners from
 	proposed assignments. Do not imply that recording an owner assigns them externally.
@@ -33,4 +37,3 @@ If the outcome, constraints or scope need a user decision, return to Todo with t
 question and why it prevents planning. Todo is the only configured return target.
 For unavailable research or access, report the blocker rather than claiming the plan is
 ready. Otherwise follow the configured workflow; do not assume Implementation is enrolled.
-

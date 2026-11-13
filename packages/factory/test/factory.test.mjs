@@ -79,7 +79,7 @@ test("composition retains order, policies, contexts, and lazy callbacks without 
 	let executions = 0;
 	const executor = { async execute({ task }) { executions += 1; return { output: task.title }; } };
 	const stage = new Stage({ name: "Review", agents: [], contexts: [context], instruction: "Review", policies: {
-		returns: lazy, gates: lazy, permissions: { createNewTasks: true },
+		returns: lazy, gates: lazy, permissions: { createNewTasks: true, publishPullRequest: true },
 	}, hooks: { beforeAgents: lazy, afterAgents: lazy } });
 	const stages = [stage, new Stage({ name: "Done", agents: [], contexts: [], instruction: "Done" })];
 	const workflow = new Workflow({ name: "Main", container: new Container.MicroVM({ image: "ubuntu:latest", cpu: 4, memory: "16GB" }),
@@ -93,6 +93,7 @@ test("composition retains order, policies, contexts, and lazy callbacks without 
 	assert.equal(stage.options.contexts[0], context);
 	assert.equal(stage.options.hooks.afterAgents, lazy);
 	assert.equal(stage.options.policies.permissions.createNewTasks, true);
+	assert.equal(stage.options.policies.permissions.publishPullRequest, true);
 	assert.equal(workflow.options.policies.maxRetries, 3);
 	assert.equal(workflow.options.container.options.memory, "16GB");
 });

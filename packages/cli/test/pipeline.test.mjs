@@ -58,6 +58,9 @@ test("pipeline resolves prompt files, shares contexts/VM across returns, and gat
 			assert.equal(request.contexts[0].data.get("ready"), true);
 			assert.equal(request.instructions, "Workflow prompt\n\nLoaded stage\n\nLoaded skill");
 			assert.equal(request.task.description, "Details");
+			assert.deepEqual(request.handoff, executions === 1 ? undefined : {
+				stage: "Build", agent: "Builder", attempt: 1, output: "Needs revision",
+			});
 			return executions === 1 ? { returnTo: build, output: "Needs revision" } : { output: "Finished" };
 		}, { maxRetries: 1 });
 		const result = await runPipeline(config, task(), join(directory, "factory.ts"), host({ output: output => outputs.push(output) }));
@@ -67,6 +70,51 @@ test("pipeline resolves prompt files, shares contexts/VM across returns, and gat
 		assert.equal(containers[0].state, "destroyed");
 		assert.deepEqual(outputs.map(output => [output.attempt, output.text]), [[1, "Needs revision"], [2, "Finished"]]);
 	} finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("pipeline hands off outputs across agents, stages, and Checks returns without sharing findings contexts", async () => {
+	const findings = new SessionContext({ description: "Checks findings" });
+	const recorder = agent.with({ name: "Recorder" });
+	const checker = agent.with({ name: "Checker" });
+	const implementation = stage({ name: "Implementation", agents: [agent, recorder] });
+	const checks = stage({ name: "Checks", agents: [checker], contexts: [findings.expectWrite()],
+		policies: { returns: () => [implementation] } });
+	const done = stage({ name: "Done" });
+	const initial = { stage: "Implementation", agent: "Builder", attempt: 1, output: "Implemented the planned change at abc123" };
+	const failed = { stage: "Checks", agent: "Checker", attempt: 1, output: "typecheck failed at abc123: missing handoff type. Add the type and rerun typecheck." };
+	const corrected = { stage: "Implementation", agent: "Builder", attempt: 2, output: "Added the missing handoff type at def456" };
+	const passed = { stage: "Checks", agent: "Checker", attempt: 2, output: "typecheck passed at def456" };
+	const received = [];
+	const outputs = [];
+	let implementationVisits = 0;
+	let checksVisits = 0;
+	const config = configFor([implementation, checks, done], async request => {
+		received.push([request.stage.options.name, request.agent.options.name, request.handoff]);
+		if (request.stage === implementation) {
+			assert.deepEqual(request.contexts, []);
+			if (request.agent === recorder) return;
+			implementationVisits++;
+			return { output: implementationVisits === 1 ? initial.output : corrected.output };
+		}
+		if (request.stage === checks) {
+			checksVisits++;
+			const output = checksVisits === 1 ? failed.output : passed.output;
+			request.contexts[0].data.set("summary", output);
+			return checksVisits === 1 ? { output, returnTo: implementation } : { output };
+		}
+	}, { maxRetries: 1 });
+	const result = await runPipeline(config, task(), "/tmp/factory.ts", host({ output: output => outputs.push(output) }));
+	assert.equal(result.state, "completed");
+	assert.deepEqual(received, [
+		["Implementation", "Builder", undefined],
+		["Implementation", "Recorder", initial],
+		["Checks", "Checker", initial],
+		["Implementation", "Builder", failed],
+		["Implementation", "Recorder", corrected],
+		["Checks", "Checker", corrected],
+		["Done", "Builder", passed],
+	]);
+	assert.deepEqual(outputs, [initial, failed, corrected, passed].map(({ output, ...sender }) => ({ ...sender, text: output })));
 });
 
 test("failed gate awaits its entire batch, skips mutations, and fails without retrying", async () => {

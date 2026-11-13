@@ -2,6 +2,7 @@ import { posix } from "node:path";
 import type { ExecutorRequest, ExecutorResult, SessionContext } from "@buckles/factory";
 import type { Tool, ToolResultObject } from "@github/copilot-sdk";
 import { SessionContext as GithubContext } from "./github.js";
+import type { RepositorySession } from "./repository.js";
 
 export interface ToolSettings {
 	cwd: string;
@@ -41,6 +42,8 @@ export async function interruptible<Result>(work: Promise<Result>, signal: Abort
 export class CopilotTools {
 	readonly tools: Tool[] = [];
 	result?: ExecutorResult;
+	blocked?: string;
+	repository?: RepositorySession;
 	#closed = false;
 	#tail: Promise<unknown> = Promise.resolve();
 	#contexts: readonly SessionContext[];
@@ -97,6 +100,21 @@ export class CopilotTools {
 		this.add("bind_github", "Bind a declared GitHub context to an existing pull request in a host-authorized repository for later workflow hooks. Credentials are supplied by the host, never in tool arguments.",
 			{ context: contextIndex, owner: string, repo: string, pullNumber: { type: "integer", minimum: 1 } },
 			["context", "owner", "repo", "pullNumber"], args => this.bindGithub(args));
+		if (request.stage.options.policies?.permissions?.publishPullRequest === true) {
+			this.add("publish_pull_request", "Commit explicit changed files, run nonempty verification commands in the guest, and publish the task-owned branch and one pull request. Uses host authentication without exposing credentials. Reuse this tool after repairs; do not git push from the guest.",
+				{ context: contextIndex, title: string, body: string, paths: { type: "array", items: string, minItems: 1 }, checks: { type: "array", items: string, minItems: 1 } },
+				["context", "title", "body", "paths", "checks"], args => {
+					const context = this.context(args.context);
+					if (!(context instanceof GithubContext)) throw new TypeError("Selected context is not a Github.SessionContext");
+					if (!this.repository) throw new Error("Publication requires CopilotExecutor({ repository: {} }) and host GitHub authentication");
+					const strings = (value: unknown, name: string) => {
+						if (!Array.isArray(value) || !value.length) throw new TypeError(`${name} must be a nonempty array`);
+						return value.map(item => text(item, name, 4096));
+					};
+					return this.repository.publish(context, { title: text(args.title, "title", 256), body: text(args.body, "body"),
+						paths: strings(args.paths, "paths"), checks: strings(args.checks, "checks") });
+				});
+		}
 		this.add("report", "Report task progress to the live factory task view.", { message: string }, ["message"], args => {
 			request.report(this.redact(text(args.message, "message", 4096)));
 			return "Progress reported";
@@ -129,7 +147,14 @@ export class CopilotTools {
 				this.result = { output, ...(returnTo ? { returnTo } : {}) };
 				return "Stage completion recorded";
 			}, false, true);
+		this.add("block_stage", "End this invocation as failed with the concrete reason it cannot proceed. Never reports success.",
+			{ reason: string }, ["reason"], args => {
+				this.blocked = this.redact(text(args.reason, "reason", settings.maxOutputBytes));
+				return "Stage blocked; failure recorded";
+			}, false, true);
 	}
+
+	get ended(): boolean { return Boolean(this.result || this.blocked); }
 
 	contextDescriptions(): unknown[] {
 		return this.#contexts.map((context, index) => ({ index, description: context.options.description,
@@ -148,7 +173,7 @@ export class CopilotTools {
 					try {
 						this.signal.throwIfAborted();
 						invocation.signal?.throwIfAborted();
-						if (this.#closed || this.result) throw new Error("Agent invocation has ended; no further tools may run");
+						if (this.#closed || this.ended) throw new Error("Agent invocation has ended; no further tools may run");
 						const args = object(input);
 						if (Object.keys(args).some(key => !Object.hasOwn(properties, key)) || required.some(key => !Object.hasOwn(args, key))) {
 							throw new TypeError("Tool arguments do not match the declared schema");
@@ -176,14 +201,14 @@ export class CopilotTools {
 
 	private snapshot(context: SessionContext): unknown {
 		return { data: Object.fromEntries(context.data), ...(context instanceof GithubContext ? {
-			github: { bound: context.bound, snapshot: context.snapshot, approval: context.approval, mergeResult: context.mergeResult },
+			github: { bound: context.bound, binding: context.binding, snapshot: context.snapshot, checks: context.checks, approval: context.approval, mergeResult: context.mergeResult },
 		} : {}) };
 	}
 
 	private bindGithub(args: Record<string, unknown>): unknown {
 		const context = this.context(args.context);
 		if (!(context instanceof GithubContext)) throw new TypeError("Selected context is not a Github.SessionContext");
-		if (!this.settings.githubToken) throw new Error("PR binding requires CopilotExecutor({ githubToken }); supply the token on the host, not in chat");
+		if (!this.settings.githubToken) throw new Error('PR binding requires CopilotExecutor({ githubToken }) or githubAuth: "cli"; configure authentication on the host, not in chat');
 		if (typeof args.pullNumber !== "number" || !Number.isSafeInteger(args.pullNumber) || args.pullNumber <= 0) {
 			throw new TypeError("pullNumber must be a positive safe integer");
 		}

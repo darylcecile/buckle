@@ -25,6 +25,16 @@ description: "Use during Implementation to deliver the planned outcome, address 
 	recovery policy with the necessary repository permissions. Stage assignment alone
 	does not authorize destructive git operations, pushing, migrations or new services.
 	Preserve dependency order and PR targets, and obtain fresh evidence for changed heads.
+6. Only Implementation has `publishPullRequest` permission. Call `publish_pull_request`
+	with githubContext's index, title, body, the intended `paths` and repository-derived
+	`checks` commands (both nonempty arrays).
+	It executes those commands in the guest, publishes the actual `buckles/verification`
+	status on the real PR head, binds githubContext and requests/re-requests Copilot review.
+	Use its actual response for the PR URL, revision and verification results. Do not run
+	guest git push, gh login, or a credential-bearing clone: private repository access and
+	publication use host credentials that are intentionally absent from the guest.
+	A failed command remains failed evidence for Checks; repair the source when returned,
+	then publish the updated head and rerun checks. Do not claim a status from your summary.
 
 ## Handoff and returns
 
@@ -37,6 +47,8 @@ Return to Todo for an unresolved outcome or user decision. Return to Triage for 
 selection, responsibility, dependency or plan issue. Include the concrete question or
 conflict and evidence, not just a stage name.
 
-When the scoped work is complete, hand off the evidence to the next configured stage.
+Before advancing, publish the scoped work and hand off its real PR URL, head SHA, source
+changes, commands and results to the next configured stage. An existing PR must likewise
+have current-head publication/check evidence. Preserve userDecisions.delivery: PR-only work
+still goes through Checks and all three reviewers, then halts before the merge mutation.
 Do not run review or merge actions merely because their stage definitions exist.
-

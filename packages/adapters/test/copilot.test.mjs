@@ -7,6 +7,8 @@ import test from "node:test";
 import { Agent, Container, Model, SessionContext, Stage, Workflow } from "@buckles/factory";
 import { Github } from "../dist/index.js";
 import { copilotSdk } from "../dist/copilot.js";
+import { repositoryHost } from "../dist/repository-auth.js";
+import { RepositoryWorkspaces } from "../dist/repository.js";
 import { microsandbox } from "../../factory/dist/container.js";
 
 const resources = { image: "alpine:3.22", memory: "512MiB", cpu: 1 };
@@ -95,6 +97,16 @@ function sdkDriver(context, dispatch, options = {}) {
 function value(result) {
 	assert.equal(result.resultType, "success", result.textResultForLlm);
 	return JSON.parse(result.textResultForLlm);
+}
+
+function budgetClock(context) {
+	context.mock.timers.enable({ apis: ["setTimeout"] });
+	let now = 0;
+	context.mock.method(performance, "now", () => now);
+	return milliseconds => {
+		now += milliseconds;
+		context.mock.timers.tick(milliseconds);
+	};
 }
 
 test("dispatch uses the selected task VM, declared contexts and real runtime callbacks, then returns explicit completion", async context => {
@@ -224,6 +236,56 @@ test("missing completion rejects; cleanup failures remain visible alongside the 
 	await task.invocation.container.destroy();
 });
 
+test("blocked final replies retain bounded diagnostics and redact execution-time CLI authentication", async context => {
+	const token = "test-resolved-cli-secret";
+	const auth = context.mock.method(repositoryHost, "run", async (command, args, options) => {
+		assert.equal(command, "gh");
+		assert.deepEqual(args, ["auth", "token", "--hostname", "github.com"]);
+		assert.equal(options.env.GH_TOKEN, undefined);
+		return token;
+	});
+	const task = request();
+	sdkDriver(context, async () => ({ data: { content: `Private checkout is unavailable: ${token}` } }));
+	const executor = new Github.CopilotExecutor({ githubAuth: "cli" });
+	assert.equal(auth.mock.callCount(), 0);
+	await assert.rejects(executor.execute(task.invocation), /Final assistant response: Private checkout is unavailable: \[redacted\]/);
+	await task.invocation.container.destroy();
+	const explicit = request();
+	sdkDriver(context, async ({ call }) => { value(await call("block_stage", { reason: "Required repository access is missing" })); });
+	await assert.rejects(new Github.CopilotExecutor({ githubAuth: "cli", githubToken: "explicit-token" }).execute(explicit.invocation), /stage blocked: Required repository access is missing/);
+	assert.equal(auth.mock.callCount(), 1, "explicit GitHub token takes precedence over CLI login");
+	await explicit.invocation.container.destroy();
+});
+
+test("repository metadata and return handoff reach the model; publication requires stage permission", async context => {
+	const task = request();
+	task.invocation.handoff = { stage: "Review", agent: "Reviewer", attempt: 2, output: "Repair the documented command" };
+	const metadata = { name: "acme/project", baseBranch: "main", baseSha: "a".repeat(40), headSha: "a".repeat(40), branch: "buckles/task-1", workspace: "/workspace" };
+	const published = [];
+	context.mock.method(RepositoryWorkspaces.prototype, "prepare", async () => ({ metadata, publish: async (...args) => { published.push(args); return { pullNumber: 7 }; } }));
+	const executor = new Github.CopilotExecutor({ repository: { name: "acme/project" }, githubToken: "test-repository-token" });
+	sdkDriver(context, async ({ call, observed }) => {
+		const prompt = JSON.parse(observed.message.prompt);
+		assert.deepEqual(prompt.repository, metadata);
+		assert.deepEqual(prompt.handoff, task.invocation.handoff);
+		assert.equal(observed.sessionConfiguration.tools.some(tool => tool.name === "publish_pull_request"), false);
+		value(await call("bind_github", { context: 1, owner: "acme", repo: "project", pullNumber: 7 }));
+		value(await call("complete_stage", { summary: "Inspected the repository" }));
+	});
+	await executor.execute(task.invocation);
+	await task.invocation.container.destroy();
+	const implementation = request({ stage: { policies: { permissions: { publishPullRequest: true } } } });
+	sdkDriver(context, async ({ call }) => {
+		assert.equal((await call("publish_pull_request", { context: 1, title: "Change", body: "Details", paths: ["README.md"], checks: [] })).resultType, "failure");
+		assert.deepEqual(value(await call("publish_pull_request", { context: 1, title: "Change", body: "Details", paths: ["README.md"], checks: ["check-docs"] })), { pullNumber: 7 });
+		value(await call("complete_stage", { summary: "Published the verified change" }));
+	});
+	await executor.execute(implementation.invocation);
+	assert.equal(published.length, 1);
+	assert.equal(published[0][0], implementation.github);
+	await implementation.invocation.container.destroy();
+});
+
 test("provider startup failure cleans up its client and host workspace without exposing credentials", async context => {
 	const token = "test-startup-secret";
 	const task = request();
@@ -265,14 +327,93 @@ test("cancellation aborts Copilot and waits for admitted guest work before relea
 	await task.invocation.container.destroy();
 });
 
-test("an unanswered human question observes the invocation deadline instead of inventing an answer", { timeout: 2000 }, async context => {
+test("a human wait longer than the work budget accepts the answer and completes", async context => {
+	const advance = budgetClock(context);
 	const task = request();
-	task.invocation.ask = () => new Promise(() => {});
+	const entered = Promise.withResolvers();
+	const answer = Promise.withResolvers();
+	task.invocation.ask = () => { entered.resolve(); return answer.promise; };
+	const observed = sdkDriver(context, async ({ call }) => {
+		assert.equal(value(await call("ask_user", { question: "Need a decision" })), "Use the existing target");
+		value(await call("complete_stage", { summary: "Applied the user's decision" }));
+	});
+	let settled = false;
+	const execution = new Github.CopilotExecutor({ timeoutMs: 100 }).execute(task.invocation).finally(() => { settled = true; });
+	await entered.promise;
+	advance(10_000);
+	await setImmediate();
+	assert.equal(settled, false);
+	assert.equal(observed.aborts, 0);
+	assert.equal(observed.timeout, Infinity, "the SDK wall-clock deadline must not compete with the active budget");
+	answer.resolve("Use the existing target");
+	assert.deepEqual(await execution, { output: "Applied the user's decision" });
+	advance(10_000);
+	assert.equal(observed.aborts, 0);
+	assert.equal(observed.disconnects, 1);
+	assert.equal(observed.stops, 1);
+	await task.invocation.container.destroy();
+});
+
+test("active time accumulates across repeated questions, including a rejected answer", async context => {
+	const advance = budgetClock(context);
+	const task = request();
+	let questions = 0;
+	task.invocation.ask = async () => {
+		advance(10_000);
+		if (++questions === 2) throw new Error("Question dismissed");
+		return "First answer";
+	};
+	const observed = sdkDriver(context, async ({ call }) => {
+		advance(35);
+		assert.equal(value(await call("ask_user", { question: "First decision" })), "First answer");
+		advance(25);
+		const rejected = await call("ask_user", { question: "Second decision" });
+		assert.equal(rejected.resultType, "failure");
+		assert.match(rejected.textResultForLlm, /Question dismissed/);
+		advance(39);
+		value(await call("report", { message: "One millisecond of active budget remains" }));
+		advance(1);
+	});
+	await assert.rejects(new Github.CopilotExecutor({ timeoutMs: 100 }).execute(task.invocation), /Copilot execution timed out/);
+	assert.equal(questions, 2);
+	assert.ok(task.reports.includes("One millisecond of active budget remains"));
+	assert.equal(observed.aborts, 1);
+	assert.equal(observed.stops, 1);
+	await task.invocation.container.destroy();
+});
+
+test("cancellation while waiting closes the invocation without waiting for a human or rearming its budget", async context => {
+	const advance = budgetClock(context);
+	const task = request();
+	const entered = Promise.withResolvers();
+	const answer = Promise.withResolvers();
+	task.invocation.ask = () => { entered.resolve(); return answer.promise; };
 	const observed = sdkDriver(context, async ({ call }) => {
 		const response = await call("ask_user", { question: "Need a decision" });
 		assert.equal(response.resultType, "failure");
 	});
-	await assert.rejects(new Github.CopilotExecutor({ timeoutMs: 50 }).execute(task.invocation), /timed out/);
+	const execution = new Github.CopilotExecutor({ timeoutMs: 100 }).execute(task.invocation);
+	const rejected = assert.rejects(execution, /cancelled while waiting/);
+	await entered.promise;
+	advance(10_000);
+	task.controller.abort(new Error("cancelled while waiting"));
+	await rejected;
+	assert.equal(observed.aborts, 1);
+	assert.equal(observed.disconnects, 1);
+	assert.equal(observed.stops, 1);
+	await assert.rejects(access(observed.clientConfiguration.workingDirectory), { code: "ENOENT" });
+	answer.resolve("Late answer");
+	await setImmediate();
+	advance(10_000);
+	assert.equal(observed.aborts, 1);
+	await task.invocation.container.destroy();
+});
+
+test("self-driving active work still expires at the configured budget", async context => {
+	const advance = budgetClock(context);
+	const task = request({ agent: { mode: "self-driving" } });
+	const observed = sdkDriver(context, async () => { advance(100); });
+	await assert.rejects(new Github.CopilotExecutor({ timeoutMs: 100 }).execute(task.invocation), /Copilot execution timed out/);
 	assert.equal(observed.aborts, 1);
 	assert.equal(observed.stops, 1);
 	await task.invocation.container.destroy();
@@ -296,6 +437,7 @@ test("PR binding shares the original context and exposes prepared snapshots with
 		const snapshot = await call("read_context", { context: 1 });
 		snapshots.push(snapshot);
 		assert.equal(value(snapshot).github.snapshot.pullRequest.number, 7);
+		assert.deepEqual(value(snapshot).github.binding, { owner: "acme", repo: "project", pullNumber: 7 });
 		const command = value(await call("guest_exec", { command: "tool-output-check" }));
 		assert.ok(command.stdout.startsWith("x".repeat(16_380)));
 		assert.equal(command.stdout.includes("test"), false);
